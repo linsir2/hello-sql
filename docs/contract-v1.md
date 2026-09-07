@@ -50,14 +50,22 @@ value      := NUMBER | STRING
 - STRING：单引号，`''` 转义单引号，不允许跨行，未闭合报语法错。
 - 语句末尾允许至多一个分号；一次 parse 只收一条语句。
 
-## 2. 共享契约文件
+## 2. contracts/ 只放共享数据格式（不放任何人的方法）
+
+原则：跨模块传递的“消息格式”放 contracts/（单一代码真相）；
+任何模块的方法（parse、Storage 类、Runner 类）定义在各自包的
+`__init__.py` 里，不在 contracts/ 重复。方法清单的文字版只在本文档。
 
 | 文件 | 内容 | 谁写 | 谁读 |
 |---|---|---|---|
 | contracts/ast.py | AST 全部类型与不变式 | A 负责维护 | A 产出、C 消费 |
-| contracts/storage.py | Storage 接口与语义 | B 负责实现 | B 实现、C 调用 |
+| contracts/storage.py | Storage 相关共享数据形状（Row/TableInfo） | 只读 | B 产出、C 读取 |
 | contracts/errors.py | 9 个错误码与异常 | 三方共用 | 三方 + REPL |
 | contracts/result.py | QueryResult | C 维护 | C 产出、测试消费 |
+
+Storage 的方法签名不写进共享代码：由 B 在 storage/__init__.py 里定义
+`class Storage` 并对外暴露（别人 `from storage import Storage` 使用），
+作为方法清单的唯一代码真相；本文档第 3 节的方法表是三方对语义的会议契约。
 
 ## 3. Storage 具体函数（B 交付物）
 

@@ -1,7 +1,12 @@
-"""契约 V1.0 —— 存储接口（模块 B 实现，模块 C 调用）。
+"""契约 V1.0 —— Storage 相关的共享数据形状。
+
+这里只放 B 与 C 之间传递的“数据格式”，不包含任何方法定义：
+Storage 类（含全部方法签名与实现）由 B 在 storage/ 目录里定义，
+它是方法清单的唯一代码真相。
+方法清单与语义的会议契约见 docs/contract-v1.md 第 3 节。
 
 B 的内部（文件格式、目录布局、是否分页）完全自由；契约只约束
-“构造方式 + 方法签名 + 语义 + 持久化结果”。
+“构造方式 + 方法语义 + 持久化结果”。
 
 红线：
 - B 不解析 SQL，不知道 SELECT / WHERE 是什么；
@@ -12,9 +17,7 @@ B 的内部（文件格式、目录布局、是否分页）完全自由；契约
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Protocol
 
 from contracts.ast import ColumnDef, Value
 
@@ -30,54 +33,8 @@ Row = tuple[RowId, tuple[Value, ...]]
 
 @dataclass(frozen=True)
 class TableInfo:
+    """表结构：describe 的返回格式，由 B 构造、C 读取。"""
+
     name: str
     columns: tuple[ColumnDef, ...]   # 建表顺序，只读
-
-
-class Storage(Protocol):
-    """B 必须实现的方法集合。所有可预期失败抛 contracts.errors 里的错误码。"""
-
-    def create_table(self, name: str, columns: Sequence[ColumnDef]) -> None:
-        """建表并持久化元数据。
-        - 表已存在 -> E_TABLE_EXISTS
-        - columns 为空 / 列名重复 -> E_DUP_COLUMN
-        - 列顺序即永久存储顺序
-        """
-
-    def drop_table(self, name: str) -> None:
-        """删除表及其全部数据。表不存在 -> E_TABLE_NOT_FOUND。"""
-
-    def list_tables(self) -> list[str]:
-        """返回当前所有表名。顺序不保证。"""
-
-    def describe(self, name: str) -> TableInfo:
-        """返回表结构。表不存在 -> E_TABLE_NOT_FOUND。"""
-
-    def insert(self, name: str, values: Sequence[Value]) -> RowId:
-        """追加一行（values 按建表列顺序），返回新 row_id。
-        - 表不存在 -> E_TABLE_NOT_FOUND
-        - 长度与列数不匹配 -> E_VALUE_COUNT
-        - 值类型不匹配 -> E_TYPE_MISMATCH
-        - 类型规则：INT 只收 int（显式拒绝 bool）；TEXT 只收 str；
-          REAL 收 int 或 float，内部统一存 float。
-        """
-
-    def scan(self, name: str) -> Iterator[Row]:
-        """返回全表行迭代器。表不存在 -> E_TABLE_NOT_FOUND。
-        行顺序不保证；迭代期间调用方不得同时写该表
-        （执行层必须先收集 row_id 再逐个 update/delete）。
-        """
-
-    def update_row(self, name: str, row_id: RowId, values: Sequence[Value]) -> None:
-        """整行替换：values 为完整新行，按建表列顺序。
-        - 表不存在 -> E_TABLE_NOT_FOUND
-        - row_id 不存在 -> E_ROW_NOT_FOUND
-        - 长度 / 类型校验规则同 insert
-        """
-
-    def delete_row(self, name: str, row_id: RowId) -> None:
-        """删除一行。
-        - 表不存在 -> E_TABLE_NOT_FOUND
-        - row_id 不存在 -> E_ROW_NOT_FOUND
-        """
 
