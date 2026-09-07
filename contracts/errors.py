@@ -1,0 +1,43 @@
+"""契约 V1.0 —— 错误码与异常（三个模块共用）。
+
+归属规则（谁抛什么，写在谁的错误上）：
+- E_SYNTAX：A 抛（ParseError）；
+- 表 / 列 / 个数 / 类型类错误：C 在语义检查时抛；
+  B 在自己的方法边界做同样的防御性检查时也抛同码；
+- E_ROW_NOT_FOUND、E_STORAGE：B 抛。
+
+REPL 捕获 SqlError 后打印 [错误码] 消息，然后回到提示符。
+"""
+
+from __future__ import annotations
+
+
+# 错误码全集：字符串值本身即契约，不要改动。
+E_SYNTAX = "E_SYNTAX"
+E_TABLE_NOT_FOUND = "E_TABLE_NOT_FOUND"
+E_TABLE_EXISTS = "E_TABLE_EXISTS"
+E_COLUMN_NOT_FOUND = "E_COLUMN_NOT_FOUND"
+E_DUP_COLUMN = "E_DUP_COLUMN"
+E_VALUE_COUNT = "E_VALUE_COUNT"
+E_TYPE_MISMATCH = "E_TYPE_MISMATCH"
+E_ROW_NOT_FOUND = "E_ROW_NOT_FOUND"
+E_STORAGE = "E_STORAGE"
+
+
+class SqlError(Exception):
+    """所有可预期错误的基类。message 建议用英文，便于测试稳定。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"[{code}] {message}")
+
+
+class ParseError(SqlError):
+    """语法错误：A 唯一允许抛的异常，带行列号。"""
+
+    def __init__(self, line: int, col: int, message: str) -> None:
+        self.line = line
+        self.col = col
+        super().__init__(E_SYNTAX, f"syntax error at line {line}, col {col}: {message}")
+
