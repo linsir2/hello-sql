@@ -7,7 +7,7 @@
 SQL 文本 ->(A parse)-> AST ->(C 语义检查 + WHERE 求值)-> 表级调用 ->(B CRUD)-> 行数据 ->(C 打印)
 ```
 
-三个模块：A=编译（compiler/）、B=存储（storage_engine/）、C=运行（runner/）。
+三个模块：A=编译（compiler/）、B=存储（storage/）、C=运行（runner/）。
 
 ## 0. 开工前必须画勾的默认决策
 
@@ -114,7 +114,7 @@ SELECT 表头规则：显式列按书写顺序；`*` 按建表列顺序展开；
 
 ## 6. 模块红线
 
-- `compiler`、`storage_engine`、`runner` 之间禁止互相 import；各自只能
+- `compiler`、`storage`、`runner` 之间禁止互相 import；各自只能
   import `contracts`。只有将来的 main.py 允许同时 import 三家。
 - A 不知道表存不存在；B 不知道 SQL 语法；C 不知道 B 的文件格式和 A 的实现。
 - 谁都不许改别人目录里的文件；契约要改走第 8 节流程。
@@ -137,4 +137,3 @@ SELECT 表头规则：显式列按书写顺序；`*` 按建表列顺序展开；
 2. AST 变更至少 A+C 同意；Storage 变更至少 B+C 同意；文法 / 类型 / 错误码
    需要三方同意。
 3. 同意后升版本号（V1.1），禁止悄悄改共享文件。
-
