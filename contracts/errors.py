@@ -4,7 +4,9 @@
 - E_SYNTAX：A 抛（ParseError）；
 - 表 / 列 / 个数 / 类型类错误：C 在语义检查时抛；
   B 在自己的方法边界做同样的防御性检查时也抛同码；
-- E_ROW_NOT_FOUND、E_STORAGE：B 抛。
+- E_ROW_NOT_FOUND、E_STORAGE：B 抛；
+- 数据库层：E_DATABASE_NOT_FOUND / E_DATABASE_EXISTS 由 B（DatabaseServer）抛；
+  E_DATABASE_IN_USE 由 C 抛（正在使用的库）或 B 抛（默认库 main）。
 
 REPL 捕获 SqlError 后打印 [错误码] 消息，然后回到提示符。
 """
@@ -23,6 +25,11 @@ E_TYPE_MISMATCH = "E_TYPE_MISMATCH"
 E_ROW_NOT_FOUND = "E_ROW_NOT_FOUND"
 E_STORAGE = "E_STORAGE"
 
+# 数据库层
+E_DATABASE_NOT_FOUND = "E_DATABASE_NOT_FOUND"
+E_DATABASE_EXISTS = "E_DATABASE_EXISTS"
+E_DATABASE_IN_USE = "E_DATABASE_IN_USE"
+
 
 class SqlError(Exception):
     """所有可预期错误的基类。message 建议用英文，便于测试稳定。"""
@@ -40,4 +47,3 @@ class ParseError(SqlError):
         self.line = line
         self.col = col
         super().__init__(E_SYNTAX, f"syntax error at line {line}, col {col}: {message}")
-
