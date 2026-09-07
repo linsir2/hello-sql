@@ -1,4 +1,4 @@
-"""契约 V1.0 —— Storage 相关的共享数据形状。
+"""契约 V1.1 —— Storage 相关的共享数据形状。
 
 这里只放 B 与 C 之间传递的“数据格式”，不包含任何方法定义：
 Storage 类（含全部方法签名与实现）由 B 在 storage/ 目录里定义，
@@ -37,4 +37,3 @@ class TableInfo:
 
     name: str
     columns: tuple[ColumnDef, ...]   # 建表顺序，只读
-

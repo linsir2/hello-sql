@@ -1,4 +1,4 @@
-"""契约 V1.0 —— 错误码与异常（三个模块共用）。
+"""契约 V1.1 —— 错误码与异常（三个模块共用）。
 
 归属规则（谁抛什么，写在谁的错误上）：
 - E_SYNTAX：A 抛（ParseError）；
@@ -7,6 +7,8 @@
 - E_ROW_NOT_FOUND、E_STORAGE：B 抛；
 - 数据库层：E_DATABASE_NOT_FOUND / E_DATABASE_EXISTS 由 B（DatabaseServer）抛；
   E_DATABASE_IN_USE 由 C 抛（正在使用的库）或 B 抛（默认库 main）。
+- E_BAD_ARG：B 在公开方法边界上拒绝非法库名 / 表名时抛；
+  正常 SQL 路径由 A 的标识符规则保证不会触发。
 
 REPL 捕获 SqlError 后打印 [错误码] 消息，然后回到提示符。
 """
@@ -29,6 +31,9 @@ E_STORAGE = "E_STORAGE"
 E_DATABASE_NOT_FOUND = "E_DATABASE_NOT_FOUND"
 E_DATABASE_EXISTS = "E_DATABASE_EXISTS"
 E_DATABASE_IN_USE = "E_DATABASE_IN_USE"
+
+# 参数非法（库名 / 表名不符合 [a-z_][a-z0-9_]*，或为空）
+E_BAD_ARG = "E_BAD_ARG"
 
 
 class SqlError(Exception):

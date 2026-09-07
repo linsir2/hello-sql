@@ -1,4 +1,4 @@
-"""契约 V1.0 —— 执行结果（模块 C 输出，REPL 与测试消费）。"""
+"""契约 V1.1 —— 执行结果（模块 C 输出，REPL 与测试消费）。"""
 
 from __future__ import annotations
 
@@ -19,4 +19,3 @@ class QueryResult:
     columns: tuple[str, ...] | None = None
     rows: tuple[tuple[Value, ...], ...] | None = None
     affected_rows: int | None = None
-

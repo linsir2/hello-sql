@@ -249,4 +249,47 @@ GOLDEN_SQL: list[dict[str, Any]] = [
         "code": "E_DATABASE_IN_USE",
         "note": "默认库 main 不可删除（B 拦截）",
     },
+    # ---- 跨库隔离（不同库里的表互不可见） ----
+    {
+        "id": "g32",
+        "sql": "CREATE DATABASE shop2;",
+        "expect": "ok",
+        "affected": 0,
+        "note": "再建一个库 shop2",
+    },
+    {
+        "id": "g33",
+        "sql": "USE shop2;",
+        "expect": "ok",
+        "affected": 0,
+        "note": "切到 shop2",
+    },
+    {
+        "id": "g34",
+        "sql": "CREATE TABLE orders (id INT, item TEXT);",
+        "expect": "ok",
+        "affected": 0,
+        "note": "在 shop2 里建 orders 表",
+    },
+    {
+        "id": "g35",
+        "sql": "USE main;",
+        "expect": "ok",
+        "affected": 0,
+        "note": "切回 main",
+    },
+    {
+        "id": "g36",
+        "sql": "SELECT * FROM orders;",
+        "expect": "error",
+        "code": "E_TABLE_NOT_FOUND",
+        "note": "跨库隔离：main 里看不到 shop2 的 orders 表",
+    },
+    {
+        "id": "g37",
+        "sql": "DROP DATABASE shop2;",
+        "expect": "ok",
+        "affected": 0,
+        "note": "清理 shop2（当前在 main，允许删除）",
+    },
 ]

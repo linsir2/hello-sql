@@ -1,4 +1,4 @@
-# 契约 V1.0（冻结稿）
+# 契约 V1.1（冻结稿）
 
 目标：做一个能运行的 SQL demo。用户输入一条 SQL，返回结果表格或错误。
 全项目只有一条交接链：
@@ -67,7 +67,7 @@ value      := NUMBER | STRING
 |---|---|---|---|
 | contracts/ast.py | AST 全部类型与不变式 | A 负责维护 | A 产出、C 消费 |
 | contracts/storage.py | Storage 相关共享数据形状（Row/TableInfo） | 只读 | B 产出、C 读取 |
-| contracts/errors.py | 12 个错误码与异常 | 三方共用 | 三方 + REPL |
+| contracts/errors.py | 13 个错误码与异常 | 三方共用 | 三方 + REPL |
 | contracts/result.py | QueryResult | C 维护 | C 产出、测试消费 |
 
 方法签名不写进共享代码：由 B 在 storage/__init__.py 里定义
@@ -85,6 +85,9 @@ B 分两层：
 
 目录布局：`data/<库名>/<表文件>`。进程重启后，已建的库和表数据必须
 完整可读。
+
+B 的所有公开方法先校验库名 / 表名：非空且匹配 `[a-z_][a-z0-9_]*`，
+否则抛 `E_BAD_ARG`（校验先于存在性检查；正常 SQL 路径不会触发）。
 
 ### 3.0 表级函数（Storage，原 8 个方法不变）
 
@@ -124,7 +127,7 @@ B 分两层：
 DROP DATABASE 时由 C 先拦“当前正在使用的库”（E_DATABASE_IN_USE），
 B 再拦默认库 main。
 
-## 4. 错误码（12 个）
+## 4. 错误码（13 个）
 
 ```text
 E_SYNTAX           A 抛（ParseError，带行列号）
@@ -139,6 +142,7 @@ E_STORAGE          B 内部错误：文件损坏 / IO 失败（B 抛）
 E_DATABASE_NOT_FOUND  库不存在（B 的 DatabaseServer 抛）
 E_DATABASE_EXISTS     建库冲突（B 的 DatabaseServer 抛）
 E_DATABASE_IN_USE     正在使用的库不可删（C 抛）或默认库 main 不可删（B 抛）
+E_BAD_ARG             非法库名 / 表名（B 公开方法边界校验）
 ```
 
 ## 5. 执行结果
@@ -173,11 +177,11 @@ USE DATABASE 与建库/删库同属 DDL：affected_rows = 0；REPL 对 USE 可�
   B=建表-插入-扫描-更新-删除 + 重启后数据仍在；C=用 FakeStorage 跑通
   语义检查、WHERE 求值、结果格式。
 - 集成日：main.py 把真 parse + 真 Storage 注入 Runner，按顺序跑
-  tests/golden_sql.py 全部 31 条，一条不差即完成。
+  tests/golden_sql.py 全部 37 条，一条不差即完成。
 
 ## 8. 契约变更流程
 
 1. 提议人写清“现状 -> 问题 -> 新条文”，并同步改 golden。
 2. AST 变更至少 A+C 同意；Storage 变更至少 B+C 同意；文法 / 类型 / 错误码
    需要三方同意。
-3. 同意后升版本号（V1.1），禁止悄悄改共享文件。
+3. 同意后升版本号（当前 V1.1 → 下一个版本），禁止悄悄改共享文件。
