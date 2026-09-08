@@ -95,6 +95,27 @@ B 的所有公开方法先校验库名 / 表名：非空且匹配 `[a-z_][a-z0-9
 
 ### 3.0 表级函数（Storage，原 8 个方法不变）
 
+签名（参数与返回，C 按此调用；类型均为 contracts 里的共享类型：
+ColumnDef/SqlType/Value 在 contracts/ast.py，RowId/Row/TableInfo 在
+contracts/storage.py）：
+
+```python
+class Storage:  # 每个实例 = server.connect(库名) 得到的、绑定某个库的连接
+    def create_table(self, name: str, columns: Sequence[ColumnDef]) -> None: ...
+    def drop_table(self, name: str) -> None: ...
+    def list_tables(self) -> list[str]: ...
+    def describe(self, name: str) -> TableInfo: ...
+    def insert(self, name: str, values: Sequence[Value]) -> RowId: ...
+    def scan(self, name: str) -> Iterator[Row]: ...
+    def update_row(self, name: str, row_id: RowId, values: Sequence[Value]) -> None: ...
+    def delete_row(self, name: str, row_id: RowId) -> None: ...
+```
+
+参数 / 返回约定：
+- `name`：当前库下的小写表名；`values` / `columns` 按建表列顺序；
+- `RowId = int`；`Row = (row_id, 按建表列顺序的值元组)`；
+- `insert` 返回新 row_id；`scan` 返回行迭代器；其余方法返回 None。
+
 | 函数 | 成功 | 失败（错误码） |
 |---|---|---|
 | `create_table(name, columns)` | 建表并持久化元数据；列顺序即永久顺序 | `E_TABLE_EXISTS`；空列/重复列 `E_DUP_COLUMN` |
@@ -117,6 +138,22 @@ B 的所有公开方法先校验库名 / 表名：非空且匹配 `[a-z_][a-z0-9
 文件格式、是否分页都是 B 的自由；契约只要求上面的语义和“重启可读”。
 
 ### 3.1 库级函数（DatabaseServer）
+
+签名（参数与返回）：
+
+```python
+class DatabaseServer:
+    def __init__(self, data_dir: str | Path): ...   # 自动创建默认库 main
+    def create_database(self, name: str) -> None: ...
+    def drop_database(self, name: str) -> None: ...
+    def list_databases(self) -> list[str]: ...
+    def has_database(self, name: str) -> bool: ...
+    def connect(self, name: str) -> Storage: ...
+```
+
+参数约定：`name` 为小写库名；`data_dir` 为库根目录；
+`list_databases()` 始终包含 `main`；`connect(name)` 返回绑定该库的
+Storage（同一文件里的 Storage 类）。
 
 | 函数 | 成功 | 失败（错误码） |
 |---|---|---|
