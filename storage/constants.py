@@ -33,6 +33,12 @@ FREE_LIST_END = 0  # 链表尾哨兵：0 表示“没有下一个空闲页”
 
 # ---- 数据页 slotted 布局（D07）----
 PAGE_HEADER_SIZE = 8   # u16 slot_count + u16 flags + u32 free_ptr
+PAGE_SLOT_COUNT_OFFSET = 0
+PAGE_SLOT_COUNT_SIZE = 2
+PAGE_FLAGS_OFFSET = 2
+PAGE_FLAGS_SIZE = 2
+PAGE_FREE_PTR_OFFSET = 4
+PAGE_FREE_PTR_SIZE = 4
 SLOT_SIZE = 8          # u32 record_offset + u32 record_length
 RECORD_HEADER_SIZE = 8  # 记录头：u64 row_id
 TEXT_LEN_SIZE = 4

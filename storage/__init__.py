@@ -28,20 +28,29 @@ import shutil
 from pathlib import Path
 from typing import Iterator, Sequence
 
-from contracts.ast import ColumnDef, Value
+from contracts.ast import ColumnDef, SqlType, Value
 from contracts.errors import (
     E_BAD_ARG,
     E_DATABASE_EXISTS,
     E_DATABASE_IN_USE,
     E_DATABASE_NOT_FOUND,
     E_STORAGE,
+    E_TABLE_EXISTS,
+    E_TYPE_MISMATCH,
+    E_VALUE_COUNT,
     SqlError,
 )
 from contracts.storage import Row, RowId, TableInfo
 
 from storage.cache import BufferPool
 from storage.catalog import Catalog
-from storage.constants import CATALOG_FILE_NAME, DEFAULT_CACHE_CAPACITY
+from storage.constants import (
+    CATALOG_FILE_NAME,
+    DEFAULT_CACHE_CAPACITY,
+    TABLE_FILE_SUFFIX,
+)
+from storage.engine import TableEngine
+from storage.pager import create_table_file
 
 
 _IDENTIFIER_RE = re.compile(r"[a-z_][a-z0-9_]*\Z")
@@ -51,6 +60,48 @@ def _validate_identifier(name: str) -> None:
     """库名/表名边界：非空、小写、匹配 [a-z_][a-z0-9_]*，否则 E_BAD_ARG。"""
     if not isinstance(name, str) or not _IDENTIFIER_RE.fullmatch(name):
         raise SqlError(E_BAD_ARG, f"invalid name: {name!r}")
+
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
+def _normalize_values(
+    columns: Sequence[ColumnDef], values: Sequence[Value]
+) -> tuple[Value, ...]:
+    """公开方法的值边界检查（§3.2）：个数 → 类型 → REAL 归一化为 float。
+
+    返回归一化后的值元组，供 engine 直接编码；校验失败抛契约错误码。
+    """
+    if len(values) != len(columns):
+        raise SqlError(
+            E_VALUE_COUNT,
+            f"expected {len(columns)} values, got {len(values)}",
+        )
+    normalized: list[Value] = []
+    for column, value in zip(columns, values):
+        if column.type is SqlType.INT:
+            if isinstance(value, bool) or type(value) is not int:
+                raise SqlError(E_TYPE_MISMATCH, f"INT column {column.name!r} got {value!r}")
+            if not _INT64_MIN <= value <= _INT64_MAX:
+                raise SqlError(
+                    E_TYPE_MISMATCH,
+                    f"INT column {column.name!r} out of 64-bit range: {value}",
+                )
+            normalized.append(value)
+        elif column.type is SqlType.REAL:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise SqlError(
+                    E_TYPE_MISMATCH, f"REAL column {column.name!r} got {value!r}"
+                )
+            normalized.append(float(value))
+        else:  # SqlType.TEXT
+            if type(value) is not str:
+                raise SqlError(
+                    E_TYPE_MISMATCH, f"TEXT column {column.name!r} got {value!r}"
+                )
+            normalized.append(value)
+    return tuple(normalized)
 
 
 class DatabaseServer:
@@ -176,14 +227,15 @@ class DatabaseServer:
 class Storage:
     """表层：一个实例 = 绑定某个库的连接（D03/D12）。
 
-    已实现（M0）：构造 = 载入本库 catalog；
-    未实现（M2）：8 个表级方法（create_table/drop_table/…）。
+    已实现：M0 库级目录 + M2 全部 8 个表级方法（create/drop/list/describe/
+    insert/scan/update/delete）；M3 起方法内落盘改为“缓存帧 + 方法末 flush”。
 
     不变量（对外可见行为）：
     - 表级方法的 name 一律是“当前库下的小写表名”；
     - A 负责把标识符转小写，B 边界仍按 [a-z_][a-z0-9_]* 校验（D13）；
     - 每个“会改数据”的公开方法返回前，本方法涉及的脏页已 flush（D11）；
-    - row_id 只在“本次运行、scan 之后、update/delete 之前”有效（契约）。
+    - row_id 只在“本次运行、scan 之后、update/delete 之前”有效（契约）；
+    - 每张表一个 TableEngine（含 rid→页 映射），drop_table 时丢弃（D08）。
     """
 
     def __init__(self, db_path: Path, pool: BufferPool) -> None:
@@ -192,35 +244,94 @@ class Storage:
         self._pool = pool
         self._catalog = Catalog(self._db_path / CATALOG_FILE_NAME)
         self._catalog.load()
+        self._engines: dict[str, TableEngine] = {}
+
+    # ---- 内部辅助 ----
+
+    def _table_file_path(self, name: str) -> Path:
+        return self._db_path / f"{name}{TABLE_FILE_SUFFIX}"
+
+    def _engine_for(self, name: str, columns: Sequence[ColumnDef]) -> TableEngine:
+        """惰性取得/创建该表的引擎；drop_table 会把它从字典移除。"""
+        engine = self._engines.get(name)
+        if engine is None:
+            engine = TableEngine(self._table_file_path(name), columns, self._pool)
+            self._engines[name] = engine
+        return engine
 
     def create_table(self, name: str, columns: Sequence[ColumnDef]) -> None:
-        """M2：建表文件 + 页 0 → catalog.register 并保存（§9.4）。"""
-        raise NotImplementedError("M2：create_table")
+        """建表：E_BAD_ARG → 存在性预检 → 建文件+页0 → register → save（§9.4）。
+
+        存在性预检必须在建文件之前，防止覆盖既有表数据；
+        中途失败留下的孤儿表文件本期容忍（catalog 是权威）。
+        """
+        _validate_identifier(name)
+        if name in self._catalog.tables:
+            raise SqlError(E_TABLE_EXISTS, f"table already exists: {name}")
+        create_table_file(self._table_file_path(name))
+        self._catalog.register(name, columns)  # 空列/重复列 → E_DUP_COLUMN
+        try:
+            self._catalog.save()
+        except SqlError:
+            self._catalog.tables.pop(name, None)  # 回滚内存，保持与磁盘一致
+            raise
 
     def drop_table(self, name: str) -> None:
-        """M2：catalog 摘牌 → 清缓存帧 → 删表文件（D11）。"""
-        raise NotImplementedError("M2：drop_table")
+        """删表：摘牌并 save → 删表文件；目录先摘牌杜绝“有目录没文件”（§9.4）。"""
+        _validate_identifier(name)
+        columns = self._catalog.get(name)  # 缺表 → E_TABLE_NOT_FOUND
+        self._engines.pop(name, None)
+        self._catalog.unregister(name)
+        try:
+            self._catalog.save()
+        except SqlError:
+            self._catalog.tables[name] = columns  # 回滚内存注册
+            raise
+        # M3：删文件前先 self._pool.discard(self._table_file_path(name))（D11）
+        try:
+            self._table_file_path(name).unlink()
+        except FileNotFoundError:
+            pass  # 文件缺失视为可清理孤儿，drop 成功
+        except OSError as exc:
+            raise SqlError(
+                E_STORAGE, f"cannot delete table file: {self._table_file_path(name)}"
+            ) from exc
 
     def list_tables(self) -> list[str]:
-        """M2：只读 catalog，返回本库表名（稳定顺序）。"""
-        raise NotImplementedError("M2：list_tables")
+        """只读 catalog，返回本库表名（排序稳定，契约不承诺顺序）。"""
+        return self._catalog.names()
 
     def describe(self, name: str) -> TableInfo:
-        """M2：只读 catalog 返回 TableInfo（C 语义检查的唯一入口）。"""
-        raise NotImplementedError("M2：describe")
+        """只读 catalog 返回 TableInfo（C 语义检查的唯一入口，§9.1）。"""
+        _validate_identifier(name)
+        return TableInfo(name=name, columns=self._catalog.get(name))
 
     def insert(self, name: str, values: Sequence[Value]) -> RowId:
-        """M2：追加一行，返回新 row_id（D13 边界校验 + D11 flush）。"""
-        raise NotImplementedError("M2：insert")
+        """追加一行：边界校验 → engine 落页 → 返回新 row_id（§5.3）。"""
+        _validate_identifier(name)
+        columns = self._catalog.get(name)
+        normalized = _normalize_values(columns, values)
+        engine = self._engine_for(name, columns)
+        return engine.insert(normalized)
 
     def scan(self, name: str) -> Iterator[Row]:
-        """M2：整表行迭代器（顺序不承诺；按页解码副本后 unpin 再 yield，D17）。"""
-        raise NotImplementedError("M2：scan")
+        """整表行迭代器：调用时立刻校验；行错误在迭代时抛（§10）。"""
+        _validate_identifier(name)
+        columns = self._catalog.get(name)
+        engine = self._engine_for(name, columns)
+        return engine.scan()
 
     def update_row(self, name: str, row_id: RowId, values: Sequence[Value]) -> None:
-        """M2：整行替换：rid→页 → 页内按 row_id 定位 → 替换 + 立即紧凑（D08/D15）。"""
-        raise NotImplementedError("M2：update_row")
+        """整行替换：值边界检查 → engine 定位并更新（D08/D15）。"""
+        _validate_identifier(name)
+        columns = self._catalog.get(name)
+        normalized = _normalize_values(columns, values)
+        engine = self._engine_for(name, columns)
+        engine.update(row_id, normalized)
 
     def delete_row(self, name: str, row_id: RowId) -> None:
-        """M2：删除一行：定位 → 移除槽 → 立即紧凑；整页空 → 空闲页链表（D15/D05）。"""
-        raise NotImplementedError("M2：delete_row")
+        """删除一行：engine 定位 → 移除槽 → 页内紧凑（D15）。"""
+        _validate_identifier(name)
+        columns = self._catalog.get(name)
+        engine = self._engine_for(name, columns)
+        engine.delete(row_id)

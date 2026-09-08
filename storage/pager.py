@@ -82,6 +82,15 @@ def _table_page_count(file_path: Path) -> int:
     return size // PAGE_SIZE
 
 
+def page_count(pool: BufferPool, file_path: Path) -> int:
+    """返回文件当前页数（engine scan/遍历用；缺失/半页 → E_STORAGE）。
+
+    PRD §6.5 未列此原语，但 scan 需要知道文件有几页，M2 补充。
+    pool 形参同其他原语：M3 起内部可改走缓存，调用方不变。
+    """
+    return _table_page_count(file_path)
+
+
 def _check_page0(file_path: Path) -> None:
     """校验页 0 头部：magic / version 不符 → E_STORAGE（文件身份/格式错误）。"""
     try:
