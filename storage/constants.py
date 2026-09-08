@@ -48,8 +48,32 @@ REAL_SIZE = 8
 # 单条记录能放进一个数据页的最大编码长度（≈ 4080 B）
 INLINE_RECORD_LIMIT = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE
 
-# ---- 超长行溢出页链（D14，M5 实现时定稿）----
-OVERFLOW_HEADER_SIZE = 12  # 草案：u32 next_page + u64 total_len
+# ---- 超长行溢出页链（D14，M5 定稿）----
+# 槽长度最高位 = 溢出锚点标志；inline 记录最大 4080B，永不触及该位。
+SLOT_OVERFLOW_FLAG = 0x80000000
+
+# 锚点记录（存放在普通数据页槽里，物理 16B）：
+# u64 row_id + u32 first_chain_page + u32 total_len
+OVERFLOW_ANCHOR_SIZE = 16
+OVERFLOW_ANCHOR_ROW_ID_OFFSET = 0
+OVERFLOW_ANCHOR_ROW_ID_SIZE = 8
+OVERFLOW_ANCHOR_FIRST_PAGE_OFFSET = 8
+OVERFLOW_ANCHOR_FIRST_PAGE_SIZE = 4
+OVERFLOW_ANCHOR_TOTAL_LEN_OFFSET = 12
+OVERFLOW_ANCHOR_TOTAL_LEN_SIZE = 4
+
+# 溢出页头（每页 16B）：magic b"OVFL" + u32 next_page + u64 total_len。
+# magic 让 scan 能识别链页、不与数据页/空闲页混读（替换 12B 草案）。
+OVERFLOW_MAGIC = b"OVFL"
+OVERFLOW_HEADER_SIZE = 16
+OVERFLOW_NEXT_PAGE_OFFSET = 4
+OVERFLOW_NEXT_PAGE_SIZE = 4
+OVERFLOW_TOTAL_LEN_OFFSET = 8
+OVERFLOW_TOTAL_LEN_SIZE = 8
+OVERFLOW_PAYLOAD_SIZE = PAGE_SIZE - OVERFLOW_HEADER_SIZE
+
+# 单行编码总长上限（防演示把内存/缓存撑爆；超出仍 E_STORAGE）
+MAX_ROW_BYTES = 16 * 1024 * 1024
 
 # ---- 缓存（D16）----
 DEFAULT_CACHE_CAPACITY = 64

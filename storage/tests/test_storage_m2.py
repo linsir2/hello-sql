@@ -240,16 +240,19 @@ def test_scan_missing_table_raises_immediately(storage):
     _expect_code(lambda: storage.scan("ghost"), E_TABLE_NOT_FOUND)
 
 
-def test_row_too_large_raises_storage_with_m5_notice(storage):
-    """编码后超 INLINE_RECORD_LIMIT 的行 M2 明确报 E_STORAGE（D14）。
+def test_row_over_inline_limit_is_stored_as_overflow_and_readable(
+    storage, data_dir
+):
+    """编码超 INLINE_RECORD_LIMIT 的行 M5 起走溢出页链，正常落库且重启可读。
 
-    断言的改动：M2 静默截断/写坏页，或不带“M5 前不支持”的说明。
+    断言的改动：超长行仍报错/静默截断，或重启后溢出内容丢失。
     """
     storage.create_table("notes", (ColumnDef("body", SqlType.TEXT),))
     huge = "x" * 5000
 
-    _expect_code(lambda: storage.insert("notes", (huge,)), E_STORAGE)
-    assert list(storage.scan("notes")) == []
+    assert storage.insert("notes", (huge,)) == 1
+    assert list(storage.scan("notes")) == [(1, (huge,))]
+    assert list(_reopen(data_dir).scan("notes")) == [(1, (huge,))]
 
 
 # ---- update_row / delete_row ----
