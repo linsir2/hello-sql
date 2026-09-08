@@ -1,9 +1,9 @@
-"""LogicalPlan 包：对外导出稳定类型（base / expressions / plans）。
+"""LogicalPlan 包：对外导出稳定类型（base / expressions / plans / builder）。
 
 - base.py：LogicalColumn、LogicalSchema、LogicalPlan 基类；
 - expressions.py：绑定表达式（Bound* 节点、bind_expr、求值）；
-- plans.py：八类 V1 计划节点；
-- builder.py / explain.py：Statement -> 计划树的构建与格式化，后续版本补全。
+- plans.py：V1 计划节点；
+- builder.py：Statement -> 计划树；
 """
 
 from runner.logical_plan.base import (
@@ -12,6 +12,7 @@ from runner.logical_plan.base import (
     LogicalPlan,
     LogicalSchema,
 )
+from runner.logical_plan.builder import DescribeTable, LogicalPlanBuilder
 from runner.logical_plan.expressions import (
     BOOLEAN,
     ArithOp,
@@ -39,14 +40,17 @@ from runner.logical_plan.expressions import (
     normalize_literal,
 )
 from runner.logical_plan.plans import (
+    LogicalCreateDatabase,
     LogicalCreateTable,
     LogicalDelete,
+    LogicalDropDatabase,
     LogicalDropTable,
     LogicalFilter,
     LogicalInsert,
     LogicalProjection,
     LogicalScan,
     LogicalUpdate,
+    LogicalUseDatabase,
 )
 
 __all__ = [
@@ -55,6 +59,9 @@ __all__ = [
     "LogicalColumn",
     "LogicalPlan",
     "LogicalSchema",
+    # builder
+    "DescribeTable",
+    "LogicalPlanBuilder",
     # expressions
     "BOOLEAN",
     "TypeKind",
@@ -81,12 +88,15 @@ __all__ = [
     "eval_expr",
     "normalize_literal",
     # plans
+    "LogicalCreateDatabase",
     "LogicalCreateTable",
     "LogicalDelete",
+    "LogicalDropDatabase",
     "LogicalDropTable",
     "LogicalFilter",
     "LogicalInsert",
     "LogicalProjection",
     "LogicalScan",
     "LogicalUpdate",
+    "LogicalUseDatabase",
 ]

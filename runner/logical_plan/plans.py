@@ -109,7 +109,55 @@ class LogicalProjection(LogicalPlan):
         )
 
 
-# ---------- DDL 与 DML 节点 ----------
+# ---------- 数据库命令节点 ----------
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalCreateDatabase(LogicalPlan):
+    """创建数据库：叶子节点，存在性由执行阶段交给 DatabaseServer。"""
+
+    name: str
+
+    @property
+    def children(self) -> tuple[LogicalPlan, ...]:
+        return ()
+
+    @property
+    def output_schema(self) -> LogicalSchema:
+        return EMPTY_SCHEMA
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalDropDatabase(LogicalPlan):
+    """删除数据库：叶子节点，当前库保护和存在性由执行阶段处理。"""
+
+    name: str
+
+    @property
+    def children(self) -> tuple[LogicalPlan, ...]:
+        return ()
+
+    @property
+    def output_schema(self) -> LogicalSchema:
+        return EMPTY_SCHEMA
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalUseDatabase(LogicalPlan):
+    """切换当前数据库：叶子节点，由执行阶段更新 Runner 会话状态。"""
+
+    name: str
+
+    @property
+    def children(self) -> tuple[LogicalPlan, ...]:
+        return ()
+
+    @property
+    def output_schema(self) -> LogicalSchema:
+        return EMPTY_SCHEMA
+
+
+# ---------- 表 DDL 与 DML 节点 ----------
 
 
 @dataclass(frozen=True, slots=True)
