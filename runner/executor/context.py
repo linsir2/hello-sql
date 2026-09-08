@@ -6,6 +6,14 @@ from dataclasses import dataclass
 @dataclass(slots=True)
 class ExecutionContext:
     """
-    Executor 共享的执行环境。
+    Executor 共享的执行环境与会话状态。
     """
+
+    server: object
+    """DatabaseServer：建库 / 删库 / 连接数据库。"""
+
     storage: object
+    """当前数据库的表级操作连接（Storage）。"""
+
+    current_database: str
+    """当前数据库名，用于删库时的会话检查。"""
