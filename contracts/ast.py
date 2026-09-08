@@ -1,10 +1,10 @@
-"""契约 V1.0 —— AST（编译模块 A 的唯一输出，运行模块 C 的输入）。
+"""契约 V1.1 —— AST（编译模块 A 的唯一输出，运行模块 C 的输入）。
 
 冻结规则：字段与语义一经确认即冻结；任何改动需三方同意，并同步
 docs/contract-v1.md 与 tests/golden_sql.py。
 
 不变式（A 必须保证，C 可以信任）：
-- table / column 名一律已小写、非空；
+- database / table / column 名一律已小写、非空；
 - 值已转成 Python 原生类型，AST 里不允许出现字符串形态的数字；
 - 表达式只有 列 op 字面量，用 AND 连接，没有括号、没有 OR。
 """
@@ -84,6 +84,27 @@ Expr: TypeAlias = Cmp | And
 # ---------- 语句 ----------
 
 
+# ---------- 数据库语句 ----------
+
+
+@dataclass(frozen=True)
+class CreateDatabaseStmt:
+    name: str      # 已小写、非空
+
+
+@dataclass(frozen=True)
+class DropDatabaseStmt:
+    name: str      # 已小写、非空
+
+
+@dataclass(frozen=True)
+class UseDatabaseStmt:
+    name: str      # 已小写、非空
+
+
+# ---------- 表语句 ----------
+
+
 @dataclass(frozen=True)
 class CreateTableStmt:
     table: str
@@ -122,11 +143,13 @@ class DeleteStmt:
 
 
 Statement: TypeAlias = (
-    CreateTableStmt
+    CreateDatabaseStmt
+    | DropDatabaseStmt
+    | UseDatabaseStmt
+    | CreateTableStmt
     | DropTableStmt
     | InsertStmt
     | SelectStmt
     | UpdateStmt
     | DeleteStmt
 )
-

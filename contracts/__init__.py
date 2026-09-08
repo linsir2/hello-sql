@@ -1,4 +1,4 @@
-"""共享契约包（V1.0 冻结）。
+"""共享契约包（V1.1 冻结）。
 
 三方共同约定：
 - contracts/ast.py     —— A 输出、C 输入
@@ -10,5 +10,4 @@
 tests/golden_sql.py。
 """
 
-__version__ = "1.0"
-
+__version__ = "1.1"
