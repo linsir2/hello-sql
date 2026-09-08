@@ -8,8 +8,8 @@
   记录从 offset 8 起向后写，槽（8 B = offset + len）从页尾向前长；
 - 任何时刻：活记录连在页头之后、槽连在页尾之前，中间是单块连续空闲区；
   空闲区 = (PAGE_SIZE - 8 * slot_count) - free_ptr；
-- 删除 / 整行更新后立即页内紧凑（D15）；M2 整页空页面留在文件内可复用，
-  M4 起才还进空闲页链表（D05）；
+- 删除 / 整行更新后立即页内紧凑（D15）；整页空 → 还进空闲页链表（D05，
+  M2/M3 过渡期曾留在文件内复用，M4 起改为 free_page）；
 - 记录编码：u64 row_id + 按列序的值（INT 8 B / REAL 8 B / TEXT 4 B 长 + UTF-8），
   不带类型标签；解码按同一份 ColumnDef；解码失败 → E_STORAGE。
 
@@ -21,7 +21,8 @@ row_id 不变量（D08）：
 超长行（D14）：编码长度 > INLINE_RECORD_LIMIT 时走溢出页链；M5 实现，
 M2 对超长行抛 E_STORAGE 并在消息中标注（§8.4）。
 
-实现阶段：M2 已完成（行存取）；M4 补空闲页回收；M5 溢出页链与损坏矩阵。
+实现阶段：M2 已完成（行存取）；M4 已完成（空闲页回收 D05/D06）；
+M5 溢出页链与损坏矩阵。
 """
 
 from __future__ import annotations
@@ -45,7 +46,14 @@ from storage.constants import (
     RECORD_HEADER_SIZE,
     SLOT_SIZE,
 )
-from storage.pager import alloc_page, page_count, read_page, write_page
+from storage.pager import (
+    alloc_page,
+    free_page,
+    free_pages,
+    page_count,
+    read_page,
+    write_page,
+)
 
 
 # 记录编码格式（§8.1）：u64 row_id；INT=q；REAL=d；TEXT=u32 长度 + UTF-8。
@@ -274,16 +282,29 @@ class TableEngine:
     def _find_page_for(self, record_length: int) -> tuple[int, bytearray] | None:
         """在现有数据页里找能放下新记录的一页；没有返回 None。
 
-        M2 无 free list：文件里 1..N-1 全是数据页，逐页读页头看剩余空间。
+        M4：只遍历不在 free list 的活动页（空闲页前 4 B 是 next 指针）。
         """
-        total_pages = page_count(self._pool, self._path)
-        for page_no in range(1, total_pages):
+        for page_no in self._active_page_numbers():
             page = bytearray(read_page(self._pool, self._path, page_no))
             slot_count, _flags, free_ptr = _parse_page_header(page)
             space = PAGE_SIZE - SLOT_SIZE * (slot_count + 1) - free_ptr
             if space >= record_length:
                 return page_no, page
         return None
+
+    def _active_page_numbers(self) -> list[int]:
+        """文件里 1..N-1 中不在 free list 的页号（scan/找页/定位共用）。"""
+        free = set(free_pages(self._pool, self._path))
+        total_pages = page_count(self._pool, self._path)
+        return [page_no for page_no in range(1, total_pages) if page_no not in free]
+
+    def _write_or_free_page(self, page_no: int, page: bytearray) -> None:
+        """整页有行 → 写回；重建后整页空 → 还进空闲页链表（D05/D15）。"""
+        slot_count, _flags, _free_ptr = _parse_page_header(page)
+        if slot_count == 0:
+            free_page(self._pool, self._path, page_no)
+        else:
+            write_page(self._pool, self._path, page_no, page)
 
     def _find_slot_by_row_id(
         self, page: bytes | bytearray, row_id: RowId
@@ -312,8 +333,7 @@ class TableEngine:
             slot_index = self._find_slot_by_row_id(page, row_id)
             if slot_index is not None:
                 return page_no, page, slot_index
-        total_pages = page_count(self._pool, self._path)
-        for page_no in range(1, total_pages):
+        for page_no in self._active_page_numbers():
             page = bytearray(read_page(self._pool, self._path, page_no))
             slot_index = self._find_slot_by_row_id(page, row_id)
             if slot_index is not None:
@@ -347,8 +367,7 @@ class TableEngine:
 
     def scan(self) -> Iterator[Row]:
         """逐数据页解码 yield，顺带重建 rid→页 映射；顺序不承诺。"""
-        total_pages = page_count(self._pool, self._path)
-        for page_no in range(1, total_pages):
+        for page_no in self._active_page_numbers():
             page = read_page(self._pool, self._path, page_no)
             for row in page_rows(page, self._columns):
                 self._rid_to_page[row[0]] = page_no
@@ -366,13 +385,13 @@ class TableEngine:
             return
         # 原页放不下：先删旧行落盘，再按插入路径找新家
         remove_slot(page, slot_index)
-        write_page(self._pool, self._path, page_no, page)
+        self._write_or_free_page(page_no, page)
         new_page_no = self._place_new_record(record)
         self._rid_to_page[row_id] = new_page_no
 
     def delete(self, row_id: RowId) -> None:
-        """删除一行并立即紧凑；整页空留在文件内可复用（free list 归 M4）。"""
+        """删除一行并立即紧凑；整页空还进空闲页链表（D05/D15）。"""
         page_no, page, slot_index = self._locate(row_id)
         remove_slot(page, slot_index)
-        write_page(self._pool, self._path, page_no, page)
+        self._write_or_free_page(page_no, page)
         self._rid_to_page.pop(row_id, None)

@@ -17,8 +17,8 @@
 错误归属：本层是 B 内部原语，所有失败统一 E_STORAGE（E_BAD_ARG 只属于
 公开方法对库名/表名/值的边界，D13）。
 
-实现阶段：M1 已完成（固定页、追加页、页 0）；M3 已完成（read/write 内部
-走 BufferPool，形参冻结所以调用方没改）；M4 补空闲页回收。
+实现阶段：M1 已完成（固定页、追加页、页 0）；M3 已完成（read/write 走
+BufferPool）；M4 已完成（空闲页链表 free_page/alloc 弹链/free_pages）。
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ from storage.cache import BufferPool
 from storage.constants import (
     FIRST_ROW_ID,
     FREE_LIST_END,
+    PAGE0_FREE_HEAD_OFFSET,
+    PAGE0_FREE_HEAD_SIZE,
     PAGE0_HEADER_SIZE,
     PAGE_SIZE,
     TABLE_FILE_MAGIC,
@@ -91,6 +93,32 @@ def page_count(pool: BufferPool, file_path: Path) -> int:
     return _table_page_count(file_path)
 
 
+def free_pages(pool: BufferPool, file_path: Path) -> list[int]:
+    """遍历空闲页链表，返回链序（最新释放在前）的页号列表（D05）。
+
+    链成环 / next 越界 / 自环 → E_STORAGE；engine 扫描前用本函数避开空闲页。
+    """
+    total_pages = _table_page_count(file_path)
+    page0 = read_page(pool, file_path, 0)
+    head = int.from_bytes(
+        page0[PAGE0_FREE_HEAD_OFFSET : PAGE0_FREE_HEAD_OFFSET + PAGE0_FREE_HEAD_SIZE],
+        "little",
+    )
+    result: list[int] = []
+    seen: set[int] = set()
+    while head != FREE_LIST_END:
+        if head in seen or not 0 < head < total_pages:
+            raise SqlError(
+                E_STORAGE,
+                f"corrupt free list in {file_path}: invalid page {head}",
+            )
+        seen.add(head)
+        result.append(head)
+        free_page_bytes = read_page(pool, file_path, head)
+        head = int.from_bytes(free_page_bytes[:4], "little")
+    return result
+
+
 def _check_page0(file_path: Path) -> None:
     """校验页 0 头部：magic / version 不符 → E_STORAGE（文件身份/格式错误）。"""
     try:
@@ -120,14 +148,40 @@ def _check_page_no(file_path: Path, page_no: int, page_count: int) -> None:
 
 
 def alloc_page(pool: BufferPool, file_path: Path) -> int:
-    """分配一个数据页号：M1 只在文件末尾追加（D06）；free list 弹出留 M4。
+    """分配一个数据页号：优先弹空闲页链表，空链表才在文件末尾追加（D05/D06）。
 
     追加前校验页 0 身份，防止在冒牌/损坏文件上继续扩展（E_STORAGE）。
-    pool 形参已冻结，M3 起页 I/O 改走缓存时本函数内部再用。
     """
-    page_count = _table_page_count(file_path)
+    total_pages = _table_page_count(file_path)
     _check_page0(file_path)
-    new_page_no = page_count
+    page0 = read_page(pool, file_path, 0)
+    free_head = int.from_bytes(
+        page0[PAGE0_FREE_HEAD_OFFSET : PAGE0_FREE_HEAD_OFFSET + PAGE0_FREE_HEAD_SIZE],
+        "little",
+    )
+    if free_head != FREE_LIST_END:
+        if not 0 < free_head < total_pages:
+            raise SqlError(
+                E_STORAGE,
+                f"corrupt free list in {file_path}: head {free_head} out of range",
+            )
+        head_page = read_page(pool, file_path, free_head)
+        next_head = int.from_bytes(head_page[:4], "little")
+        if next_head == free_head or (
+            next_head != FREE_LIST_END and not 0 < next_head < total_pages
+        ):
+            raise SqlError(
+                E_STORAGE,
+                f"corrupt free list in {file_path}: next {next_head} invalid",
+            )
+        updated_page0 = bytearray(page0)
+        updated_page0[
+            PAGE0_FREE_HEAD_OFFSET : PAGE0_FREE_HEAD_OFFSET + PAGE0_FREE_HEAD_SIZE
+        ] = next_head.to_bytes(PAGE0_FREE_HEAD_SIZE, "little")
+        write_page(pool, file_path, 0, updated_page0)
+        return free_head
+    # free list 空 → 文件末尾追加一页（D06：只增不减）
+    new_page_no = total_pages
     try:
         with open(file_path, "r+b") as fh:
             fh.seek(0, os.SEEK_END)
@@ -140,8 +194,30 @@ def alloc_page(pool: BufferPool, file_path: Path) -> int:
 
 
 def free_page(pool: BufferPool, file_path: Path, page_no: int) -> None:
-    """把整页空的数据页还进空闲链表：页头写 next，页 0 free_head 指向它。"""
-    raise NotImplementedError("M4：free_page")
+    """把整页空的数据页还进空闲链表（D05）。
+
+    该页前 4 B 写入旧 free_head 作 next，页 0 free_head 指向该页；
+    文件长度不变（D06）。页 0 / 越界页号 → E_STORAGE。
+    """
+    total_pages = _table_page_count(file_path)
+    if type(page_no) is not int or not 0 < page_no < total_pages:
+        raise SqlError(
+            E_STORAGE,
+            f"cannot free page {page_no!r} in {file_path} ({total_pages} pages)",
+        )
+    page0 = read_page(pool, file_path, 0)
+    old_head = int.from_bytes(
+        page0[PAGE0_FREE_HEAD_OFFSET : PAGE0_FREE_HEAD_OFFSET + PAGE0_FREE_HEAD_SIZE],
+        "little",
+    )
+    freed = bytearray(read_page(pool, file_path, page_no))
+    freed[: PAGE0_FREE_HEAD_SIZE] = old_head.to_bytes(PAGE0_FREE_HEAD_SIZE, "little")
+    write_page(pool, file_path, page_no, freed)
+    updated_page0 = bytearray(page0)
+    updated_page0[
+        PAGE0_FREE_HEAD_OFFSET : PAGE0_FREE_HEAD_OFFSET + PAGE0_FREE_HEAD_SIZE
+    ] = page_no.to_bytes(PAGE0_FREE_HEAD_SIZE, "little")
+    write_page(pool, file_path, 0, updated_page0)
 
 
 def read_page(pool: BufferPool, file_path: Path, page_no: int) -> bytes:
