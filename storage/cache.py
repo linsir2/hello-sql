@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,8 +45,18 @@ class BufferPool:
     """
 
     def __init__(self, capacity: int = DEFAULT_CACHE_CAPACITY) -> None:
-        """M0 骨架。capacity 为 B 内部参数，不进任何公开签名（D16）。"""
-        raise NotImplementedError("M3：BufferPool.__init__")
+        """初始化容量、空帧表与统计（M0 只立状态，页操作 M3 实现）。
+
+        capacity 为 B 内部参数，不进任何公开签名（D16）。
+        """
+        if capacity <= 0:
+            raise ValueError("cache capacity must be positive")
+        self.capacity = capacity
+        self._frames: OrderedDict[tuple[Path, int], Frame] = OrderedDict()
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._dirty_writes = 0
 
     def get_page(self, file_path: Path, page_no: int) -> bytearray:
         """取页：命中直接返回；未命中读盘后返回。返回前已 pin（D17）。

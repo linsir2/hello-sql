@@ -14,18 +14,43 @@
 
 红线：本目录禁止 import compiler / runner；只允许 import contracts 与标准库。
 B 不认识 SQL / AST / 执行计划；C 不知道 B 的文件格式与内部结构。
+
+错误归属（M0 边界）：
+- 公开方法第一道闸：库/表名格式校验 → E_BAD_ARG（D13，先于一切存在性检查）；
+- 库级：main 保护 E_DATABASE_IN_USE；目录/有效库判定决定 EXISTS/NOT_FOUND；
+- “目录在但 catalog 损坏/缺失”属于存储损坏 → E_STORAGE（由 Catalog 抛）。
 """
 
 from __future__ import annotations
 
+import re
+import shutil
 from pathlib import Path
 from typing import Iterator, Sequence
 
 from contracts.ast import ColumnDef, Value
+from contracts.errors import (
+    E_BAD_ARG,
+    E_DATABASE_EXISTS,
+    E_DATABASE_IN_USE,
+    E_DATABASE_NOT_FOUND,
+    E_STORAGE,
+    SqlError,
+)
 from contracts.storage import Row, RowId, TableInfo
 
 from storage.cache import BufferPool
-from storage.constants import DEFAULT_CACHE_CAPACITY
+from storage.catalog import Catalog
+from storage.constants import CATALOG_FILE_NAME, DEFAULT_CACHE_CAPACITY
+
+
+_IDENTIFIER_RE = re.compile(r"[a-z_][a-z0-9_]*\Z")
+
+
+def _validate_identifier(name: str) -> None:
+    """库名/表名边界：非空、小写、匹配 [a-z_][a-z0-9_]*，否则 E_BAD_ARG。"""
+    if not isinstance(name, str) or not _IDENTIFIER_RE.fullmatch(name):
+        raise SqlError(E_BAD_ARG, f"invalid name: {name!r}")
 
 
 class DatabaseServer:
@@ -34,59 +59,125 @@ class DatabaseServer:
     不变量：
     - 构造时创建 data_dir，并自动创建默认库 main（永存、不可删）；
     - list_databases() 恒包含 main；
-    - 每个库 = data_dir/<库名>/ 目录，内含 catalog.json（D03/D12）；
-    - 同一 DatabaseServer 的所有 Storage 共享同一个 BufferPool（D09/D16）；
-    - 公开方法校验顺序：E_BAD_ARG（名称格式）→ 存在性 → 值/类型边界（D13）。
+    - 每个库 = data_dir/<库名>/ 目录 + catalog.json（D03/D12）；
+    - 一个“有效库”= 目录存在且内含 catalog.json；
+    - 同一 DatabaseServer 的所有 Storage 共享同一个 BufferPool（D09/D16）。
+
+    M0 已实现：构造/建库/删库/列库/has/connect；表级方法在 M2 填充。
     """
 
     def __init__(self, data_dir: str | Path) -> None:
-        """M0 骨架，尚未实现。
+        """建 data_dir → BufferPool(64) → 确保 main（目录 + catalog）。"""
+        self._data_dir = Path(data_dir)
+        try:
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SqlError(
+                E_STORAGE, f"cannot create data dir: {self._data_dir}"
+            ) from exc
+        self._pool = BufferPool(DEFAULT_CACHE_CAPACITY)
 
-        计划：创建目录 → 自建 BufferPool(DEFAULT_CACHE_CAPACITY) →
-        确保默认库 main 存在。签名固定，不可增加必填参数（契约 §3.1）。
-        """
-        raise NotImplementedError("M0：DatabaseServer.__init__")
+        main_dir = self._data_dir / "main"
+        main_catalog = main_dir / CATALOG_FILE_NAME
+        if main_dir.is_dir():
+            # main 目录已存在：catalog 必须存在且可读，损坏/缺失都不得静默重建。
+            if not main_catalog.is_file():
+                raise SqlError(
+                    E_STORAGE,
+                    f"main database dir exists but catalog missing: {main_dir}",
+                )
+            Catalog(main_catalog).load()
+        else:
+            try:
+                main_dir.mkdir()
+            except OSError as exc:
+                raise SqlError(E_STORAGE, f"cannot create main db dir: {main_dir}") from exc
+            Catalog(main_catalog).save()  # 空 catalog
+
+    # ---- 内部辅助 ----
+
+    def _db_path(self, name: str) -> Path:
+        return self._data_dir / name
+
+    @staticmethod
+    def _is_valid_db_dir(db_dir: Path) -> bool:
+        """有效库 = 目录存在且内含 catalog.json（杂目录/杂文件不算库）。"""
+        return db_dir.is_dir() and (db_dir / CATALOG_FILE_NAME).is_file()
+
+    # ---- 库级公开方法 ----
 
     def create_database(self, name: str) -> None:
-        """建库：创建 data_dir/<name>/ 并写入空 catalog（D12）。
-
-        失败：E_BAD_ARG / E_DATABASE_EXISTS。成功返回 None（DDL，affected=0 由 C 组装）。
-        """
-        raise NotImplementedError("M0：create_database")
+        """建库：目录 + 空 catalog；失败时尽量回滚已建目录。"""
+        _validate_identifier(name)
+        db_dir = self._db_path(name)
+        if db_dir.is_dir():
+            raise SqlError(E_DATABASE_EXISTS, f"database already exists: {name}")
+        try:
+            db_dir.mkdir()
+        except OSError as exc:
+            raise SqlError(
+                E_STORAGE, f"cannot create database dir: {db_dir}"
+            ) from exc
+        catalog = Catalog(db_dir / CATALOG_FILE_NAME)
+        try:
+            catalog.save()
+        except SqlError:
+            # 目录建了但 catalog 没写成 → 回滚空目录，保持“库=目录+catalog”不变式。
+            try:
+                db_dir.rmdir()
+            except OSError:
+                pass
+            raise
 
     def drop_database(self, name: str) -> None:
-        """删库：级联删掉其中所有表；main 由 B 拦 E_DATABASE_IN_USE。
+        """删库：级联删目录；main 由 B 拦 E_DATABASE_IN_USE。
 
-        顺序：先 discard 该库在缓存里的帧（D11），再删目录。
-        失败：E_BAD_ARG / E_DATABASE_NOT_FOUND / E_DATABASE_IN_USE。
+        M0 无缓存帧；M3 起在删目录前先 discard 该库全部帧（D11）。
         """
-        raise NotImplementedError("M0：drop_database")
+        _validate_identifier(name)
+        if name == "main":
+            raise SqlError(E_DATABASE_IN_USE, "cannot drop default database main")
+        db_dir = self._db_path(name)
+        if not self._is_valid_db_dir(db_dir):
+            raise SqlError(E_DATABASE_NOT_FOUND, f"database not found: {name}")
+        try:
+            shutil.rmtree(db_dir)
+        except OSError as exc:
+            raise SqlError(E_STORAGE, f"cannot drop database dir: {db_dir}") from exc
 
     def list_databases(self) -> list[str]:
-        """返回库名列表（含 main）。契约不承诺顺序；实现取稳定顺序即可。"""
-        raise NotImplementedError("M0：list_databases")
+        """返回所有有效库名（排序；契约不承诺顺序，排序只是稳定输出）。"""
+        try:
+            names = [
+                entry.name
+                for entry in self._data_dir.iterdir()
+                if self._is_valid_db_dir(entry)
+            ]
+        except OSError as exc:
+            raise SqlError(
+                E_STORAGE, f"cannot list databases under {self._data_dir}"
+            ) from exc
+        return sorted(names)
 
     def has_database(self, name: str) -> bool:
-        """库是否存在。名称非法按 B 边界抛 E_BAD_ARG。"""
-        raise NotImplementedError("M0：has_database")
+        """库是否存在（先过名称边界，再查有效库目录）。"""
+        _validate_identifier(name)
+        return self._is_valid_db_dir(self._db_path(name))
 
     def connect(self, name: str) -> Storage:
-        """连接库：载入该库 catalog → 返回绑定该库的 Storage。
-
-        失败：E_BAD_ARG / E_DATABASE_NOT_FOUND。Storage 绑定库后不再换库；
-        当前库属于 C（Runner）的会话状态，B 不保存。
-        """
-        raise NotImplementedError("M0：connect")
+        """连接库：Storage 构造时载入该库 catalog（损坏 → E_STORAGE）。"""
+        _validate_identifier(name)
+        db_dir = self._db_path(name)
+        if not self._is_valid_db_dir(db_dir):
+            raise SqlError(E_DATABASE_NOT_FOUND, f"database not found: {name}")
+        return Storage(db_dir, self._pool)
 
 
 class Storage:
     """表层：一个实例 = 绑定某个库的连接（D03/D12）。
 
-    计划字段：
-        self._catalog   本库 Catalog（describe/list_tables/insert 全靠它，私有）
-        self._engine    行级执行入口（engine.py，M2）
-        self._pool      DatabaseServer 传入的共享 BufferPool
-        self._db_path   data_dir/<库名>/
+    已实现（M0）：构造 = 载入本库 catalog；
+    未实现（M2）：8 个表级方法（create_table/drop_table/…）。
 
     不变量（对外可见行为）：
     - 表级方法的 name 一律是“当前库下的小写表名”；
@@ -96,67 +187,40 @@ class Storage:
     """
 
     def __init__(self, db_path: Path, pool: BufferPool) -> None:
-        """Storage 由 server.connect() 内部构造，不对外直接创建。
-
-        M0 骨架：仅约定内部构造参数；正式实现会在此载入 catalog（M0/M2）。
-        """
-        raise NotImplementedError("M0：Storage.__init__")
+        """绑定库目录与共享池，并载入本库 catalog（缺失/损坏 → E_STORAGE）。"""
+        self._db_path = Path(db_path)
+        self._pool = pool
+        self._catalog = Catalog(self._db_path / CATALOG_FILE_NAME)
+        self._catalog.load()
 
     def create_table(self, name: str, columns: Sequence[ColumnDef]) -> None:
-        """建表：engine 建表文件 + 写页 0 → catalog.register 并保存（§9.4）。
-
-        顺序：先建文件成功，再注册 catalog（catalog 是权威，中途失败只留孤儿文件）。
-        失败：E_BAD_ARG / E_TABLE_EXISTS / E_DUP_COLUMN（空列/重复列）。
-        """
+        """M2：建表文件 + 页 0 → catalog.register 并保存（§9.4）。"""
         raise NotImplementedError("M2：create_table")
 
     def drop_table(self, name: str) -> None:
-        """删表：catalog.unregister + 保存 → discard 缓存帧 → 删表文件（D11）。
-
-        失败：E_BAD_ARG / E_TABLE_NOT_FOUND。
-        """
+        """M2：catalog 摘牌 → 清缓存帧 → 删表文件（D11）。"""
         raise NotImplementedError("M2：drop_table")
 
     def list_tables(self) -> list[str]:
-        """返回本库表名列表（只读 catalog）。顺序不承诺，实现取稳定顺序。"""
+        """M2：只读 catalog，返回本库表名（稳定顺序）。"""
         raise NotImplementedError("M2：list_tables")
 
     def describe(self, name: str) -> TableInfo:
-        """表结构（只读 catalog，返回 TableInfo）。
-
-        C 语义检查的唯一只读入口；catalog 内部结构永不外泄。
-        失败：E_BAD_ARG / E_TABLE_NOT_FOUND。
-        """
+        """M2：只读 catalog 返回 TableInfo（C 语义检查的唯一入口）。"""
         raise NotImplementedError("M2：describe")
 
     def insert(self, name: str, values: Sequence[Value]) -> RowId:
-        """追加一行，返回新 row_id。
-
-        边界校验（D13）：表存在 → 值个数（E_VALUE_COUNT）→ 逐列类型
-        （E_TYPE_MISMATCH；INT 拒 bool；REAL 收 int/float 并归一化 float）。
-        写记录 → 返回前 flush（D11）。
-        """
+        """M2：追加一行，返回新 row_id（D13 边界校验 + D11 flush）。"""
         raise NotImplementedError("M2：insert")
 
     def scan(self, name: str) -> Iterator[Row]:
-        """整表行迭代器，顺序不承诺。
-
-        校验在调用时立刻执行（表不存在马上抛 E_TABLE_NOT_FOUND）；
-        实现按页解码成内存副本、unpin 后再逐行 yield（D17），不跨 yield 持 pin。
-        """
+        """M2：整表行迭代器（顺序不承诺；按页解码副本后 unpin 再 yield，D17）。"""
         raise NotImplementedError("M2：scan")
 
     def update_row(self, name: str, row_id: RowId, values: Sequence[Value]) -> None:
-        """整行替换：rid→页（D08）→ 页内按记录头 row_id 定位 → 替换 + 立即紧凑。
-
-        失败：E_BAD_ARG / E_TABLE_NOT_FOUND / E_ROW_NOT_FOUND /
-        E_VALUE_COUNT / E_TYPE_MISMATCH。返回前 flush（D11）。
-        """
+        """M2：整行替换：rid→页 → 页内按 row_id 定位 → 替换 + 立即紧凑（D08/D15）。"""
         raise NotImplementedError("M2：update_row")
 
     def delete_row(self, name: str, row_id: RowId) -> None:
-        """删除一行：定位 → 移除槽 → 立即紧凑（D15）；整页空 → 还进空闲页链表。
-
-        失败：E_BAD_ARG / E_TABLE_NOT_FOUND / E_ROW_NOT_FOUND。返回前 flush（D11）。
-        """
+        """M2：删除一行：定位 → 移除槽 → 立即紧凑；整页空 → 空闲页链表（D15/D05）。"""
         raise NotImplementedError("M2：delete_row")
