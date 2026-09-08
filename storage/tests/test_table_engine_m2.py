@@ -53,7 +53,9 @@ def _page0_next_row_id(table_path: Path) -> int:
 # ---- insert 与 row_id ----
 
 
-def test_insert_returns_increasing_ids_and_persists_counter(engine, table_path):
+def test_insert_returns_increasing_ids_and_persists_counter(
+    engine, table_path, pool
+):
     """连续 insert 返回 1、2、3，且页 0 next_row_id 持久化为下一个可用号。
 
     断言的改动：row_id 从 0 开始/复用、或页 0 计数没跟着 +1。
@@ -62,6 +64,7 @@ def test_insert_returns_increasing_ids_and_persists_counter(engine, table_path):
     assert engine.insert((20, "b")) == 2
     assert engine.insert((30, "c")) == 3
 
+    pool.flush(table_path)  # engine 不负责 flush（D11），断言磁盘前手动落盘
     assert _page0_next_row_id(table_path) == 4
     assert _scan_sorted(engine) == [
         (1, (10, "a")),

@@ -17,8 +17,8 @@
 错误归属：本层是 B 内部原语，所有失败统一 E_STORAGE（E_BAD_ARG 只属于
 公开方法对库名/表名/值的边界，D13）。
 
-实现阶段：M1 已完成（固定页、追加页、页 0、直通文件读写）；M3 把
-read/write 内部改走 BufferPool（形参已冻结，调用方不改）；M4 补空闲页回收。
+实现阶段：M1 已完成（固定页、追加页、页 0）；M3 已完成（read/write 内部
+走 BufferPool，形参冻结所以调用方没改）；M4 补空闲页回收。
 """
 
 from __future__ import annotations
@@ -147,24 +147,18 @@ def free_page(pool: BufferPool, file_path: Path, page_no: int) -> None:
 def read_page(pool: BufferPool, file_path: Path, page_no: int) -> bytes:
     """读一整页返回 bytes 副本。
 
-    M1 直通文件（pool 暂不使用，M3 改走缓存）；读页 0 时额外校验
+    M3 起经 BufferPool：缺页读盘、命中直接用（D09）；读页 0 时额外校验
     magic/version；页越界/半页/缺失一律 E_STORAGE。
     """
     page_count = _table_page_count(file_path)
     _check_page_no(file_path, page_no, page_count)
     if page_no == 0:
         _check_page0(file_path)
+    frame = pool.get_page(file_path, page_no)
     try:
-        with open(file_path, "rb") as fh:
-            fh.seek(page_no * PAGE_SIZE)
-            data = fh.read(PAGE_SIZE)
-    except OSError as exc:
-        raise SqlError(E_STORAGE, f"cannot read table file: {file_path}") from exc
-    if len(data) != PAGE_SIZE:
-        raise SqlError(
-            E_STORAGE, f"corrupt table file {file_path}: short read on page {page_no}"
-        )
-    return data
+        return bytes(frame)
+    finally:
+        pool.unpin_page(file_path, page_no)
 
 
 def write_page(
@@ -172,7 +166,7 @@ def write_page(
 ) -> None:
     """把一整页内容写回文件偏移 page_no * PAGE_SIZE。
 
-    M1 直通文件落盘（pool 暂不使用，M3 改走缓存帧 + 标脏）；data 必须恰好
+    M3 起写进缓存帧并标脏，真正落盘由 flush 决定（D11）；data 必须恰好
     一整页，页号必须在文件现有范围内，否则 E_STORAGE。
     """
     if not isinstance(data, (bytes, bytearray)) or len(data) != PAGE_SIZE:
@@ -181,11 +175,9 @@ def write_page(
         )
     page_count = _table_page_count(file_path)
     _check_page_no(file_path, page_no, page_count)
+    frame = pool.get_page(file_path, page_no)
     try:
-        with open(file_path, "r+b") as fh:
-            fh.seek(page_no * PAGE_SIZE)
-            written = fh.write(data)
-    except OSError as exc:
-        raise SqlError(E_STORAGE, f"cannot write table file: {file_path}") from exc
-    if written != PAGE_SIZE:
-        raise SqlError(E_STORAGE, f"short write on page {page_no}: {file_path}")
+        frame[:] = data
+        pool.mark_dirty(file_path, page_no)
+    finally:
+        pool.unpin_page(file_path, page_no)

@@ -176,6 +176,7 @@ def test_write_read_page_roundtrip_survives_new_buffer_pool(pool, table_path):
 
     write_page(pool, table_path, 1, _DATA_4096)
     assert read_page(pool, table_path, 1) == _DATA_4096
+    pool.flush(table_path)  # M3 起持久化由 flush 负责（D11）
 
     fresh_pool = BufferPool(capacity=4)
     assert read_page(fresh_pool, table_path, 1) == _DATA_4096

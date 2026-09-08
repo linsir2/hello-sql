@@ -192,9 +192,15 @@ class DatabaseServer:
         if not self._is_valid_db_dir(db_dir):
             raise SqlError(E_DATABASE_NOT_FOUND, f"database not found: {name}")
         try:
+            self._pool.discard(db_dir)  # 删库前丢弃该库全部缓存帧（D11）
             shutil.rmtree(db_dir)
         except OSError as exc:
             raise SqlError(E_STORAGE, f"cannot drop database dir: {db_dir}") from exc
+
+    @property
+    def cache_stats(self) -> dict[str, int | float]:
+        """只读命中统计快照（D18；B 内部属性，不进 13 方法契约）。"""
+        return self._pool.stats
 
     def list_databases(self) -> list[str]:
         """返回所有有效库名（排序；契约不承诺顺序，排序只是稳定输出）。"""
@@ -227,8 +233,8 @@ class DatabaseServer:
 class Storage:
     """表层：一个实例 = 绑定某个库的连接（D03/D12）。
 
-    已实现：M0 库级目录 + M2 全部 8 个表级方法（create/drop/list/describe/
-    insert/scan/update/delete）；M3 起方法内落盘改为“缓存帧 + 方法末 flush”。
+    已实现：M0 库级目录 + M2 全部 8 个表级方法 + M3 缓存接入（改数据方法
+    末 flush、drop 前 discard、DatabaseServer.cache_stats）。
 
     不变量（对外可见行为）：
     - 表级方法的 name 一律是“当前库下的小写表名”；
@@ -287,7 +293,7 @@ class Storage:
         except SqlError:
             self._catalog.tables[name] = columns  # 回滚内存注册
             raise
-        # M3：删文件前先 self._pool.discard(self._table_file_path(name))（D11）
+        self._pool.discard(self._table_file_path(name))  # 删文件前丢帧（D11）
         try:
             self._table_file_path(name).unlink()
         except FileNotFoundError:
@@ -312,7 +318,9 @@ class Storage:
         columns = self._catalog.get(name)
         normalized = _normalize_values(columns, values)
         engine = self._engine_for(name, columns)
-        return engine.insert(normalized)
+        row_id = engine.insert(normalized)
+        self._pool.flush(self._table_file_path(name))  # 方法末 flush（D11）
+        return row_id
 
     def scan(self, name: str) -> Iterator[Row]:
         """整表行迭代器：调用时立刻校验；行错误在迭代时抛（§10）。"""
@@ -328,6 +336,7 @@ class Storage:
         normalized = _normalize_values(columns, values)
         engine = self._engine_for(name, columns)
         engine.update(row_id, normalized)
+        self._pool.flush(self._table_file_path(name))  # 方法末 flush（D11）
 
     def delete_row(self, name: str, row_id: RowId) -> None:
         """删除一行：engine 定位 → 移除槽 → 页内紧凑（D15）。"""
@@ -335,3 +344,4 @@ class Storage:
         columns = self._catalog.get(name)
         engine = self._engine_for(name, columns)
         engine.delete(row_id)
+        self._pool.flush(self._table_file_path(name))  # 方法末 flush（D11）
