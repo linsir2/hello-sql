@@ -14,7 +14,7 @@ class LogicalColumn:
     字段语义：
     - table：列所属表；
     - name：列名；
-    - index：该列在当前输入行值元组中的位置；
+    - index：该列在当前输入行值元组中的零基位置（注意不是数据库表中的列所在位置，因为表的列位置经过算子计算后会发生改变）；
     - type：contracts.ast.SqlType。
     """
 

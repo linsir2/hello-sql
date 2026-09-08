@@ -207,57 +207,10 @@ class LogicalPlan(ABC):
 
 ## 6. 绑定表达式模型
 
-建议在 `expressions.py` 中定义以下不可变对象。
+见
+[logical-plan-expression-dev-design.md](logical-plan-expression-dev-design.md)。
 
-```python
-class ComparisonOp(Enum):
-    EQ = "="
-    NE = "<>"
-    LT = "<"
-    LE = "<="
-    GT = ">"
-    GE = ">="
-
-
-@dataclass(frozen=True, slots=True)
-class BoundColumnRef:
-    column: LogicalColumn
-
-
-@dataclass(frozen=True, slots=True)
-class BoundLiteral:
-    value: Value
-    type: SqlType
-
-
-@dataclass(frozen=True, slots=True)
-class BoundComparison:
-    left: BoundColumnRef
-    op: ComparisonOp
-    right: BoundLiteral
-
-
-@dataclass(frozen=True, slots=True)
-class BoundConjunction:
-    terms: tuple[BoundComparison, ...]  # 非空
-
-
-@dataclass(frozen=True, slots=True)
-class BoundAssignment:
-    target: LogicalColumn
-    value: BoundLiteral
-```
-
-设计说明：
-
-1. V1 的 WHERE 只有比较和 AND，因此不需要建立通用的任意表达式继承树。
-2. AST 的二叉 `And` 在绑定时递归展平为 `BoundConjunction.terms`，方便 FilterExecutor
-   逐项短路判断，也方便未来做谓词规则优化。
-3. `ComparisonOp` 替代任意字符串，非法操作符不能进入计划。
-4. `BoundLiteral.type` 表示完成目标类型校验后的类型。REAL 列对应的整数常量可以在绑定时规范化为
-   `float`，让后续执行逻辑更稳定。
-5. 当前 `SqlType` 没有 BOOLEAN。谓词本身用专门的 `BoundComparison/BoundConjunction`
-   表示，不错误地把谓词标成某个现有 SQL 值类型。
+本文只维护 LogicalPlan 建模本身，表达式的绑定与求值细节不再在此定义。
 
 ## 7. V1 计划节点
 
@@ -653,11 +606,8 @@ LogicalPlan
 ├── LogicalAggregate
 └── LogicalValues
 
-BoundExpression
-├── arithmetic
-├── OR / NOT
-├── column-to-column comparison
-└── NULL semantics
+BoundExpression 的扩展（算术、OR / NOT、列列比较、NULL 语义）已由
+logical-plan-expression-dev-design.md 规划，不再在此维护。
 ```
 
 物理计划应另建包，例如 `runner/physical_plan/`，将 `LogicalScan` 映射为具体的 SeqScan 或
