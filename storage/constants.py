@@ -26,6 +26,7 @@ PAGE0_NEXT_ROW_ID_SIZE = 8
 PAGE0_FREE_HEAD_OFFSET = 16
 PAGE0_FREE_HEAD_SIZE = 4
 PAGE0_HEADER_SIZE = 20  # 之后的字节全部置 0，留白
+FIRST_ROW_ID = 1        # 新建表第一个可分配的 row_id（D08；页 0 初值）
 
 # ---- 空闲页链表（D05）----
 FREE_LIST_END = 0  # 链表尾哨兵：0 表示“没有下一个空闲页”
