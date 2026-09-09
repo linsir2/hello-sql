@@ -1,16 +1,18 @@
-"""契约 V1.1 —— Storage 共享数据形状与公开接口协议。
+"""契约 V2.0：Storage 共享数据形状与公开接口协议。
 
 BaseDatabaseServer 和 BaseStorage 只约定 B 向 C 暴露的方法；具体实现、
 文件格式与内部状态均由 storage/ 维护。
 
-B 的内部（文件格式、目录布局、是否分页）完全自由；契约只约束
-“构造方式 + 方法语义 + 持久化结果”。
+B 的表数据与系统目录都必须通过 4KB 页式存储、Buffer Pool 和统一记录
+编解码链路持久化。V2 不再允许以独立 JSON 文件作为权威系统目录。
 
 红线：
 - B 不解析 SQL，不知道 SELECT / WHERE 是什么；
 - 表名、列名统一小写（由 A 转换），B 不做大小写处理；
 - DatabaseServer 接收数据目录并创建默认库，connect() 返回绑定目标库的
   BaseStorage 实现；进程重启后数据必须完整可读。
+- 系统目录是 B 的内部特殊表，不暴露为普通 SQL 表；list_tables() 只返回
+  用户表，describe() 仍是 C 获取用户表 Schema 的唯一接口。
 """
 
 from __future__ import annotations
