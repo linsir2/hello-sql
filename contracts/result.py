@@ -1,11 +1,11 @@
-"""契约 V1.1 —— 执行结果（模块 C 输出，REPL 与测试消费）。"""
+"""契约 V2.0：单语句与多语句执行结果。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeAlias
 
-from contracts.ast import Value
+from contracts.ast import SourceSpan, Value
+from contracts.errors import SqlError
 
 
 @dataclass
@@ -19,3 +19,32 @@ class QueryResult:
     columns: tuple[str, ...] | None = None
     rows: tuple[tuple[Value, ...], ...] | None = None
     affected_rows: int | None = None
+
+
+@dataclass
+class StatementResult:
+    """脚本中一条语句的执行结果。
+
+    result 与 error 恰有一个非 None；elapsed_ms 包含该语句从语义绑定到执行
+    完成或失败的耗时，不包含用户在 TUI 中的编辑时间。
+    """
+
+    sql: str
+    span: SourceSpan
+    result: QueryResult | None = None
+    error: SqlError | None = None
+    elapsed_ms: float = 0.0
+
+    def __post_init__(self) -> None:
+        if (self.result is None) == (self.error is None):
+            raise ValueError("StatementResult requires exactly one of result or error")
+        if self.elapsed_ms < 0:
+            raise ValueError("elapsed_ms must be non-negative")
+
+
+@dataclass
+class ScriptResult:
+    """一次多语句执行的汇总结果，语句顺序与源码顺序一致。"""
+
+    statements: tuple[StatementResult, ...]
+    stopped_early: bool = False

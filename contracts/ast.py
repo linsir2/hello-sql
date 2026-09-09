@@ -1,12 +1,17 @@
-"""契约 V1.1 —— AST（编译模块 A 的唯一输出，运行模块 C 的输入）。
+"""契约 V2.0：SQL 编译模块输出、运行模块输入的共享 AST。
 
-冻结规则：字段与语义一经确认即冻结；任何改动需三方同意，并同步
-docs/contract-v1.md 与 tests/golden_sql.py。
+V2 在 V1.1 的基础上增加：
+- BOOLEAN 类型与布尔字面量；
+- AND / OR / NOT、括号优先级对应的表达式树；
+- 列与列比较、表限定列和表别名；
+- INNER JOIN；
+- 带源码范围的多语句解析结果。
 
-不变式（A 必须保证，C 可以信任）：
-- database / table / column 名一律已小写、非空；
-- 值已转成 Python 原生类型，AST 里不允许出现字符串形态的数字；
-- 表达式只有 列 op 字面量，用 AND 连接，没有括号、没有 OR。
+不变式：
+- database / table / column / alias 名均已转为小写且非空；
+- 数字和布尔字面量已经转换为 Python 原生值；
+- 括号不单独保留节点，其作用体现在表达式树结构中；
+- V2 只支持 INNER JOIN，不包含 ORDER BY、LIMIT、NULL、聚合和子查询。
 """
 
 from __future__ import annotations
@@ -17,71 +22,120 @@ from typing import TypeAlias
 
 
 class SqlType(Enum):
-    """V1 只支持三种类型。"""
+    """V2 支持的四种 SQL 列类型。"""
 
     INT = "INT"
     TEXT = "TEXT"
     REAL = "REAL"
+    BOOLEAN = "BOOLEAN"
 
 
-Value: TypeAlias = int | str | float
-"""字面量在 Python 中的表示：INT->int；TEXT->str；REAL->int 或 float。"""
+Value: TypeAlias = int | str | float | bool
+"""SQL 字面量与存储值的 Python 表示；V2 不允许 NULL。"""
 
 
 @dataclass(frozen=True)
 class ColumnDef:
-    """CREATE TABLE 里的一个列定义。"""
+    """CREATE TABLE 中按声明顺序保存的一列。"""
 
-    name: str       # 已小写、非空
+    name: str
     type: SqlType
 
 
 @dataclass(frozen=True)
 class Assignment:
-    """UPDATE ... SET 里的一项。同列重复赋值 = 后者覆盖前者。"""
+    """UPDATE SET 中的一项；同列重复赋值仍采用后者覆盖前者。"""
 
-    column: str     # 已小写、非空
+    column: str
     value: Value
 
 
-# ---------- 表达式（V1 最小集） ----------
+# ---------- 表达式 ----------
 
 
 @dataclass(frozen=True)
 class Column:
-    """WHERE 里的列引用。"""
+    """列引用；qualifier 是可选的表名或表别名。"""
 
     name: str
+    qualifier: str | None = None
 
 
 @dataclass(frozen=True)
 class Literal:
-    """WHERE 里的字面量。"""
+    """已经转换为 Python 原生值的 SQL 字面量。"""
 
     value: Value
 
 
+ScalarExpr: TypeAlias = Column | Literal
+
+
 @dataclass(frozen=True)
 class Cmp:
-    """比较：左边必须是列，右边必须是字面量。"""
+    """比较表达式；两侧均可为列引用或字面量。"""
 
-    left: Column
-    op: str            # 只允许 '=' '<>' '<' '<=' '>' '>='
-    right: Literal
+    left: ScalarExpr
+    op: str
+    right: ScalarExpr
 
 
 @dataclass(frozen=True)
 class And:
-    """AND 连接。V1 没有 OR、没有括号。"""
+    """逻辑与；左右子树都必须在语义绑定后得到 BOOLEAN。"""
 
-    left: Cmp | And
-    right: Cmp | And
-
-
-Expr: TypeAlias = Cmp | And
+    left: Expr
+    right: Expr
 
 
-# ---------- 语句 ----------
+@dataclass(frozen=True)
+class Or:
+    """逻辑或；左右子树都必须在语义绑定后得到 BOOLEAN。"""
+
+    left: Expr
+    right: Expr
+
+
+@dataclass(frozen=True)
+class Not:
+    """逻辑非；operand 必须在语义绑定后得到 BOOLEAN。"""
+
+    operand: Expr
+
+
+Expr: TypeAlias = Column | Literal | Cmp | And | Or | Not
+
+
+# ---------- 查询来源 ----------
+
+
+class JoinType(Enum):
+    """V2 仅开放 INNER JOIN，保留枚举以便后续兼容扩展。"""
+
+    INNER = "INNER"
+
+
+@dataclass(frozen=True)
+class TableRef:
+    """FROM 或 JOIN 中的表引用。"""
+
+    name: str
+    alias: str | None = None
+
+    @property
+    def qualifier(self) -> str:
+        """返回名称绑定时使用的限定符：别名优先，否则使用表名。"""
+
+        return self.alias or self.name
+
+
+@dataclass(frozen=True)
+class JoinClause:
+    """按 SQL 书写顺序保存的一项 INNER JOIN。"""
+
+    right: TableRef
+    on: Expr
+    kind: JoinType = JoinType.INNER
 
 
 # ---------- 数据库语句 ----------
@@ -89,17 +143,17 @@ Expr: TypeAlias = Cmp | And
 
 @dataclass(frozen=True)
 class CreateDatabaseStmt:
-    name: str      # 已小写、非空
+    name: str
 
 
 @dataclass(frozen=True)
 class DropDatabaseStmt:
-    name: str      # 已小写、非空
+    name: str
 
 
 @dataclass(frozen=True)
 class UseDatabaseStmt:
-    name: str      # 已小写、非空
+    name: str
 
 
 # ---------- 表语句 ----------
@@ -108,7 +162,7 @@ class UseDatabaseStmt:
 @dataclass(frozen=True)
 class CreateTableStmt:
     table: str
-    columns: tuple[ColumnDef, ...]   # 非空、列名不重复；顺序 = 物理存储顺序
+    columns: tuple[ColumnDef, ...]
 
 
 @dataclass(frozen=True)
@@ -119,14 +173,22 @@ class DropTableStmt:
 @dataclass(frozen=True)
 class InsertStmt:
     table: str
-    values: tuple[Value, ...]        # 与表列数相同、按建表列顺序
+    values: tuple[Value, ...]
 
 
 @dataclass(frozen=True)
 class SelectStmt:
-    columns: tuple[str, ...] | None  # None 表示 SELECT *，展开顺序 = 建表顺序
-    table: str
+    """SELECT 查询。
+
+    字段顺序沿用 V1.1，便于 A、C 在各自分支渐进迁移。V2 完成后，显式
+    columns 必须由 Column 组成，table 必须是 TableRef。迁移期旧实现传入
+    str 不会触发运行时构造错误，但不属于最终 V2 合规输出。
+    """
+
+    columns: tuple[Column, ...] | None
+    table: TableRef
     where: Expr | None
+    joins: tuple[JoinClause, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -153,3 +215,28 @@ Statement: TypeAlias = (
     | UpdateStmt
     | DeleteStmt
 )
+
+
+# ---------- 多语句输入 ----------
+
+
+@dataclass(frozen=True)
+class SourceSpan:
+    """一条语句在完整 SQL 输入中的一基闭区间位置。"""
+
+    start_line: int
+    start_col: int
+    end_line: int
+    end_col: int
+
+
+@dataclass(frozen=True)
+class ParsedStatement:
+    """parse_script 的单条输出，保留 AST、原文和全局源码范围。"""
+
+    statement: Statement
+    sql: str
+    span: SourceSpan
+
+
+Script: TypeAlias = tuple[ParsedStatement, ...]
