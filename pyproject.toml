@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hello-sql"
+version = "1.1.0"
+description = "A small SQL database with a colorful terminal interface"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "rich>=13.9,<15",
+    "prompt-toolkit>=3.0.48,<4",
+    "pyfiglet>=1.0.2,<2",
+    "pygments>=2.18,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.5"]
+
+[project.scripts]
+hello-sql = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["compiler*", "contracts*", "runner*", "storage*"]
+exclude = ["*.tests", "*.tests.*"]
