@@ -5,6 +5,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .codex/
+*.egg-info/
+build/
+dist/
+.installer-test/
 
 ### AI Coding ###
 AGENTS.md
