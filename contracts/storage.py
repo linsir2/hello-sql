@@ -1,9 +1,7 @@
-"""契约 V1.1 —— Storage 相关的共享数据形状。
+"""契约 V1.1 —— Storage 共享数据形状与公开接口协议。
 
-这里只放 B 与 C 之间传递的“数据格式”，不包含任何方法定义：
-Storage 类（含全部方法签名与实现）由 B 在 storage/ 目录里定义，
-它是方法清单的唯一代码真相。
-方法清单与语义的会议契约见 docs/contract-v1.md 第 3 节。
+BaseDatabaseServer 和 BaseStorage 只约定 B 向 C 暴露的方法；具体实现、
+文件格式与内部状态均由 storage/ 维护。
 
 B 的内部（文件格式、目录布局、是否分页）完全自由；契约只约束
 “构造方式 + 方法语义 + 持久化结果”。
@@ -11,13 +9,15 @@ B 的内部（文件格式、目录布局、是否分页）完全自由；契约
 红线：
 - B 不解析 SQL，不知道 SELECT / WHERE 是什么；
 - 表名、列名统一小写（由 A 转换），B 不做大小写处理；
-- 实现类的构造方式必须是 Storage(data_dir: str | Path)，
-  data_dir 不存在时自动创建；进程重启后数据必须完整可读。
+- DatabaseServer 接收数据目录并创建默认库，connect() 返回绑定目标库的
+  BaseStorage 实现；进程重启后数据必须完整可读。
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 from contracts.ast import ColumnDef, Value
 
@@ -37,3 +37,46 @@ class TableInfo:
 
     name: str
     columns: tuple[ColumnDef, ...]   # 建表顺序，只读
+
+
+class BaseStorage(Protocol):
+    """绑定单个数据库的表级存储接口。"""
+
+    def create_table(
+        self,
+        name: str,
+        columns: Sequence[ColumnDef],
+    ) -> None: ...
+
+    def drop_table(self, name: str) -> None: ...
+
+    def list_tables(self) -> list[str]: ...
+
+    def describe(self, name: str) -> TableInfo: ...
+
+    def insert(self, name: str, values: Sequence[Value]) -> RowId: ...
+
+    def scan(self, name: str) -> Iterator[Row]: ...
+
+    def update_row(
+        self,
+        name: str,
+        row_id: RowId,
+        values: Sequence[Value],
+    ) -> None: ...
+
+    def delete_row(self, name: str, row_id: RowId) -> None: ...
+
+
+class BaseDatabaseServer(Protocol):
+    """管理数据库并创建 BaseStorage 连接的库级接口。"""
+
+    def create_database(self, name: str) -> None: ...
+
+    def drop_database(self, name: str) -> None: ...
+
+    def list_databases(self) -> list[str]: ...
+
+    def has_database(self, name: str) -> bool: ...
+
+    def connect(self, name: str) -> BaseStorage: ...
