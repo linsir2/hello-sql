@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from storage import DatabaseServer, Storage
+
 
 @dataclass(slots=True)
 class ExecutionContext:
@@ -9,10 +11,10 @@ class ExecutionContext:
     Executor 共享的执行环境与会话状态。
     """
 
-    server: object
+    server: DatabaseServer
     """DatabaseServer：建库 / 删库 / 连接数据库。"""
 
-    storage: object
+    storage: Storage
     """当前数据库的表级操作连接（Storage）。"""
 
     current_database: str

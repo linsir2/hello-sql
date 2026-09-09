@@ -1,4 +1,5 @@
 from runner.executor.base import RowExecutor, StatementExecutor
+from runner.executor.builder import ExecutorTreeBuilder
 from runner.executor.context import ExecutionContext
 from runner.executor.ddl import (
     CreateDatabaseExecutor,
@@ -31,6 +32,7 @@ __all__ = [
     "ExecutionContext",
     "RowExecutor",
     "StatementExecutor",
+    "ExecutorTreeBuilder",
     # DQL
     "SeqScanExecutor",
     "FilterExecutor",
