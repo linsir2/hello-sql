@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 from contracts.ast import Statement
-from contracts.errors import SqlError
 from contracts.result import QueryResult
 from contracts.storage import BaseDatabaseServer, TableInfo
 from runner.executor.builder import ExecutorTreeBuilder
@@ -55,32 +55,34 @@ class Runner:
         executor = self._executor_tree_builder.build(plan)
         return executor.execute(self._context)
 
-    def repl(self) -> None:
-        """启动交互式命令行；EOF 时正常退出。"""
-        while True:
-            try:
-                sql = input("sql> ")
-            except EOFError:
-                return
+    def list_databases(self) -> list[str]:
+        """向终端提供库名，终端不接触存储内部结构。"""
+        return self._context.server.list_databases()
 
-            if not sql.strip():
-                continue
+    def list_tables(self) -> list[str]:
+        return self._context.storage.list_tables()
 
-            try:
-                result = self.execute(sql)
-            except SqlError as error:
-                print(f"[{error.code}] {error.message}")
-                continue
+    def describe_table(self, name: str) -> TableInfo:
+        return self._describe_current_table(name)
 
-            self._print_result(result)
+    def repl(
+        self, *, data_dir: Path | None = None, plain: bool = False,
+        history: bool = True,
+    ) -> int:
+        """进入终端会话；非 TTY 自动使用纯文本，返回会话退出码。"""
+        from runner.terminal.session import TerminalSession
+
+        return TerminalSession(self, data_dir=data_dir, plain=plain, history=history).run()
 
     @staticmethod
     def _print_result(result: QueryResult) -> None:
         """以简单的制表符格式展示 QueryResult，不改变结果对象。"""
+        from runner.terminal.render import safe_text
+
         if result.columns is not None and result.rows is not None:
-            print("\t".join(result.columns))
+            print("\t".join(safe_text(column) for column in result.columns))
             for row in result.rows:
-                print("\t".join(str(value) for value in row))
+                print("\t".join(safe_text(value) for value in row))
             return
 
         print(f"{result.affected_rows} row(s) affected")
