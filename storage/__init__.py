@@ -87,7 +87,7 @@ def _normalize_values(
             if not _INT64_MIN <= value <= _INT64_MAX:
                 raise SqlError(
                     E_TYPE_MISMATCH,
-                    f"INT column {column.name!r} out of 64-bit range: {value}",
+                    f"INT column {column.name!r} out of 64-bit range",
                 )
             normalized.append(value)
         elif column.type is SqlType.REAL:
@@ -95,7 +95,15 @@ def _normalize_values(
                 raise SqlError(
                     E_TYPE_MISMATCH, f"REAL column {column.name!r} got {value!r}"
                 )
-            real_value = float(value)
+            try:
+                real_value = float(value)
+            except OverflowError:
+                # 巨 int（如 2**1024）转 double 会抛 OverflowError；
+                # 表示不了的数值按范围不符拒绝，不许把裸异常漏给调用方。
+                raise SqlError(
+                    E_TYPE_MISMATCH,
+                    f"REAL column {column.name!r} out of double range",
+                ) from None
             if not math.isfinite(real_value):
                 raise SqlError(
                     E_TYPE_MISMATCH,

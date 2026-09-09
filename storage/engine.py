@@ -519,6 +519,7 @@ class TableEngine:
 
     def scan(self) -> Iterator[Row]:
         """逐数据页解码（inline 直解，溢出行沿链拼回），顺带重建映射。"""
+        seen_rids: set[RowId] = set()
         for page_no in self._active_page_numbers():
             page = read_page(self._pool, self._path, page_no)
             for record_offset, record_length, is_overflow in _page_slot_entries(page):
@@ -537,6 +538,12 @@ class TableEngine:
                     raise SqlError(
                         E_STORAGE, "corrupt overflow row: anchor row_id mismatch"
                     )
+                if row[0] in seen_rids:
+                    raise SqlError(
+                        E_STORAGE,
+                        f"corrupt table file {self._path}: duplicate row_id {row[0]}",
+                    )
+                seen_rids.add(row[0])
                 self._rid_to_page[row[0]] = page_no
                 yield row
 
