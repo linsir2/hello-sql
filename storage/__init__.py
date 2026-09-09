@@ -23,6 +23,7 @@ B 不认识 SQL / AST / 执行计划；C 不知道 B 的文件格式与内部结
 
 from __future__ import annotations
 
+import math
 import re
 import shutil
 from pathlib import Path
@@ -94,12 +95,25 @@ def _normalize_values(
                 raise SqlError(
                     E_TYPE_MISMATCH, f"REAL column {column.name!r} got {value!r}"
                 )
-            normalized.append(float(value))
+            real_value = float(value)
+            if not math.isfinite(real_value):
+                raise SqlError(
+                    E_TYPE_MISMATCH,
+                    f"REAL column {column.name!r} must be finite, got {value!r}",
+                )
+            normalized.append(real_value)
         else:  # SqlType.TEXT
             if type(value) is not str:
                 raise SqlError(
                     E_TYPE_MISMATCH, f"TEXT column {column.name!r} got {value!r}"
                 )
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise SqlError(
+                    E_TYPE_MISMATCH,
+                    f"TEXT column {column.name!r} is not utf-8 encodable",
+                ) from None
             normalized.append(value)
     return tuple(normalized)
 
