@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shlex
 import sys
-from time import perf_counter
 from typing import TYPE_CHECKING
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory, InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.lexers import PygmentsLexer
 from prompt_toolkit.styles import Style
 from pygments.lexers.sql import SqlLexer
 
 from contracts.errors import E_BAD_ARG, SqlError
-from contracts.result import QueryResult
+from contracts.result import QueryResult, ScriptResult
 from runner.terminal.render import HELP_ITEMS, TerminalRenderer, safe_text
 
 if TYPE_CHECKING:
@@ -25,9 +26,13 @@ if TYPE_CHECKING:
 
 KEYWORDS = (
     "CREATE", "DATABASE", "DROP", "USE", "TABLE", "INSERT", "INTO", "VALUES",
-    "SELECT", "FROM", "WHERE", "UPDATE", "SET", "DELETE", "AND", "INT", "TEXT", "REAL",
+    "SELECT", "FROM", "WHERE", "UPDATE", "SET", "DELETE", "AND", "OR", "NOT",
+    "INNER", "JOIN", "ON", "AS", "INT", "TEXT", "REAL", "BOOLEAN", "TRUE", "FALSE",
 )
-COMMANDS = ("/help", "/databases", "/tables", "/describe", "/clear", "/quit")
+COMMANDS = (
+    "/help", "/databases", "/tables", "/describe", "/file",
+    "/stop-on-error", "/clear", "/quit",
+)
 STYLE = Style.from_dict({
     "prompt": "bold #64d9c3",
     "rule": "#424955",
@@ -67,15 +72,26 @@ class SqlCompleter(Completer):
 class TerminalSession:
     def __init__(
         self, runner: Runner, *, data_dir: Path | None = None,
-        plain: bool = False, history: bool = True,
+        plain: bool = False, history: bool = True, stop_on_error: bool = True,
     ) -> None:
         self.runner = runner
         self.data_dir = data_dir
         self.interactive = not plain and sys.stdin.isatty() and sys.stdout.isatty()
         self.history_enabled = history
+        self.stop_on_error = stop_on_error
         self.renderer = TerminalRenderer()
 
     def _make_prompt(self) -> PromptSession:
+        bindings = KeyBindings()
+
+        @bindings.add("enter")
+        def _execute_buffer(event) -> None:
+            event.current_buffer.validate_and_handle()
+
+        @bindings.add("escape", "enter")
+        def _insert_newline(event) -> None:
+            event.current_buffer.insert_text("\n")
+
         history = InMemoryHistory()
         if self.history_enabled and self.data_dir is not None:
             try:
@@ -91,11 +107,13 @@ class TerminalSession:
             auto_suggest=AutoSuggestFromHistory(),
             completer=SqlCompleter(self.runner),
             complete_while_typing=False,
+            multiline=True,
+            key_bindings=bindings,
             lexer=PygmentsLexer(SqlLexer),
             style=STYLE,
             bottom_toolbar=lambda: [
                 ("class:rule", "─" * self.renderer.console.width + "\n"),
-                ("", "Enter 执行 · Tab 补全 · ↑↓ 历史 · Ctrl+D 退出"),
+                ("", "Enter 执行 · Alt+Enter 换行 · Tab 补全 · ↑↓ 历史 · Ctrl+D 退出"),
             ],
             reserve_space_for_menu=3,
         )
@@ -106,15 +124,33 @@ class TerminalSession:
         else:
             self.runner._print_result(result)
 
-    def _command(self, sql: str) -> bool:
-        """返回是否识别为界面命令；SQL 仍交给 Runner.execute。"""
+    def _script_result(self, result: ScriptResult) -> bool:
+        """渲染脚本结果，返回其中是否至少有一条失败。"""
+        if self.interactive:
+            self.renderer.script_result(result)
+        else:
+            for statement in result.statements:
+                if statement.result is not None:
+                    self.runner._print_result(statement.result)
+                else:
+                    assert statement.error is not None
+                    print(f"[{statement.error.code}] {safe_text(statement.error.message)}")
+        return any(statement.error is not None for statement in result.statements)
+
+    def _command(self, sql: str) -> tuple[bool, bool]:
+        """返回（是否为界面命令，命令执行是否失败）。"""
         if not sql.startswith("/"):
-            return False
-        parts = sql.split()
+            return False, False
+        try:
+            parts = shlex.split(sql)
+        except ValueError as error:
+            raise SqlError(E_BAD_ARG, f"命令参数无效：{error}") from None
+        if not parts:
+            return False, False
         command = parts[0].lower()
-        expected = 2 if command == "/describe" else 1
+        expected = 2 if command in ("/describe", "/file", "/stop-on-error") else 1
         if command not in COMMANDS or len(parts) != expected:
-            raise SqlError(E_BAD_ARG, "未知命令或参数不正确，请输入 /help；表结构用法：/describe 表名")
+            raise SqlError(E_BAD_ARG, "未知命令或参数不正确，请输入 /help")
         if command == "/help":
             if self.interactive:
                 self.renderer.help()
@@ -131,7 +167,31 @@ class TerminalSession:
         elif command == "/describe":
             info = self.runner.describe_table(parts[1].lower())
             self._result(QueryResult(columns=("column", "type"), rows=tuple((col.name, col.type.value) for col in info.columns)))
-        return True
+        elif command == "/file":
+            result = self.runner.execute_file(
+                Path(parts[1]).expanduser(),
+                stop_on_error=self.stop_on_error,
+            )
+            return True, self._script_result(result)
+        elif command == "/stop-on-error":
+            value = parts[1].lower()
+            if value not in ("on", "off"):
+                raise SqlError(E_BAD_ARG, "/stop-on-error 只接受 on 或 off")
+            self.stop_on_error = value == "on"
+            message = f"stop-on-error = {value}"
+            if self.interactive:
+                self.renderer.console.print(message, style="#9299a6")
+            else:
+                print(message)
+        return True, False
+
+    def _execute_input(self, sql: str) -> bool:
+        """执行一个完整输入缓冲区，返回是否出现 SQL 错误。"""
+        recognized, failed = self._command(sql)
+        if recognized:
+            return failed
+        result = self.runner.execute_script(sql, stop_on_error=self.stop_on_error)
+        return self._script_result(result)
 
     def run(self) -> int:
         prompt = None
@@ -156,10 +216,8 @@ class TerminalSession:
             if sql.lower().rstrip(";") in ("/quit", "quit", "exit", "\\q"):
                 return int(failed)
             try:
-                if not self._command(sql):
-                    started = perf_counter()
-                    result = self.runner.execute(sql)
-                    self._result(result, perf_counter() - started)
+                input_failed = self._execute_input(sql)
+                failed = failed or (input_failed and not sys.stdin.isatty())
             except SqlError as error:
                 # 交互纠错后仍可正常退出；管道输入出现错误则返回非零退出码。
                 failed = failed or not sys.stdin.isatty()

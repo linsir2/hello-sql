@@ -12,5 +12,7 @@ dist/
 
 ### AI Coding ###
 AGENTS.md
+CLAUDE.md
 
+### macOS ###
 .DS_Store

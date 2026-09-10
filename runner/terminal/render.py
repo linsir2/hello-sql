@@ -14,7 +14,7 @@ from rich.table import Table
 from rich.text import Text
 
 from contracts.errors import SqlError
-from contracts.result import QueryResult
+from contracts.result import QueryResult, ScriptResult
 
 
 ACCENT = "#64d9c3"
@@ -103,9 +103,37 @@ class TerminalRenderer:
             self.console.print(Text(f"✓ {count} row{'s' if count != 1 else ''} affected{suffix}", style="#95df88"))
         self.console.print()
 
-    def error(self, error: SqlError) -> None:
-        self.console.print(Text(f"[{error.code}] {safe_text(error.message)}", style="#ff777f"))
+    def error(self, error: SqlError, elapsed: float | None = None) -> None:
+        suffix = f" · {elapsed:.3f}s" if elapsed is not None else ""
+        self.console.print(
+            Text(
+                f"[{error.code}] {safe_text(error.message)}{suffix}",
+                style="#ff777f",
+            )
+        )
         self.console.print()
+
+    def script_result(self, result: ScriptResult) -> None:
+        """按源码顺序展示脚本内每条语句的位置、结果和耗时。"""
+        total = len(result.statements)
+        for index, statement in enumerate(result.statements, start=1):
+            span = statement.span
+            self.console.print(
+                Text(
+                    f"#{index}/{total}  "
+                    f"{span.start_line}:{span.start_col}-"
+                    f"{span.end_line}:{span.end_col}",
+                    style=MUTED,
+                )
+            )
+            if statement.result is not None:
+                self.result(statement.result, statement.elapsed_ms / 1000)
+            else:
+                assert statement.error is not None
+                self.error(statement.error, statement.elapsed_ms / 1000)
+        if result.stopped_early:
+            self.console.print(Text("遇到错误，已停止执行后续语句。", style="#ffb86c"))
+            self.console.print()
 
     def help(self) -> None:
         table = Table(box=box.SIMPLE, border_style=ACCENT, title="hello-sql 帮助", highlight=False)
@@ -116,7 +144,8 @@ class TerminalRenderer:
         self.console.print(table)
         self.console.print(Text(
             "SQL：CREATE/DROP DATABASE、USE、CREATE/DROP TABLE、INSERT、SELECT、UPDATE、DELETE\n"
-            "类型：INT / TEXT / REAL；WHERE 支持比较和 AND。一次输入一条 SQL，末尾分号可省略。",
+            "类型：INT / TEXT / REAL / BOOLEAN；支持 AND / OR / NOT 与 INNER JOIN。\n"
+            "Enter 执行当前缓冲区，Alt+Enter 换行；可一次执行多条 SQL。",
             style=MUTED,
         ))
 
@@ -126,8 +155,11 @@ HELP_ITEMS = (
     ("/databases", "查看数据库"),
     ("/tables", "查看当前库的表"),
     ("/describe 表名", "查看表结构"),
+    ("/file 路径", "按 UTF-8 执行 SQL 文件"),
+    ("/stop-on-error on|off", "设置脚本遇错停止或继续"),
     ("/clear", "清理屏幕"),
     ("/quit、quit、exit", "退出程序"),
     ("Tab / ↑↓", "补全 / 浏览输入历史"),
+    ("Enter / Alt+Enter", "执行当前缓冲区 / 插入换行"),
     ("Ctrl+C / Ctrl+D", "清空尚未提交的输入 / 空输入时退出"),
 )

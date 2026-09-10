@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from contracts.ast import ColumnDef
+from contracts.ast import ColumnDef, JoinType
 from contracts.errors import E_COLUMN_NOT_FOUND, E_TYPE_MISMATCH, E_VALUE_COUNT, SqlError
 
 from runner.logical_plan.base import (
@@ -10,6 +10,7 @@ from runner.logical_plan.base import (
     LogicalColumn,
     LogicalPlan,
     LogicalSchema,
+    join_schema,
 )
 from runner.logical_plan.expressions import (
     BoundArith,
@@ -21,6 +22,8 @@ from runner.logical_plan.expressions import (
     BoundLiteral,
     BoundLogical,
     BoundUnaryNot,
+    LogicOp,
+    require_boolean,
 )
 
 # ---------- 查询节点 ----------
@@ -31,10 +34,18 @@ class LogicalScan(LogicalPlan):
     """读取一张表：叶子节点，输出 Schema 为表的完整 Schema。
 
     只声明“读哪张表”，物理计划可以把它映射为 SeqScan/IndexScan。
+    alias 不参与名称解析（解析依据是 Schema 列上的 qualifier），只让计划树自描述：
+    自连接的两侧打印为 LogicalScan[users AS u1] / LogicalScan[users AS u2]。
     """
 
     table: str
     schema: LogicalSchema
+    alias: str | None = None
+
+    @property
+    def qualifier(self) -> str:
+        """名称绑定时使用的限定符：别名优先，否则使用表名。"""
+        return self.alias or self.table
 
     @property
     def children(self) -> tuple[LogicalPlan, ...]:
@@ -57,7 +68,11 @@ class LogicalFilter(LogicalPlan):
     child: LogicalPlan
 
     def __post_init__(self) -> None:
-        if not isinstance(self.predicate, BoundLogical) or not self.predicate.terms:
+        if (
+            not isinstance(self.predicate, BoundLogical)
+            or self.predicate.op is not LogicOp.AND
+            or not self.predicate.terms
+        ):
             raise SqlError(
                 E_TYPE_MISMATCH,
                 "filter predicate must be a non-empty AND conjunction",
@@ -79,12 +94,24 @@ class LogicalProjection(LogicalPlan):
 
     SELECT name, name FROM users 在 V1 中合法，所以输出列不去重；`SELECT *`
     由 Builder 展开为全列后仍保留本节点，使所有 SELECT 都有一致的根。
+
+    output_names 是结果表头，与 columns 等长且一一对应：“是否限定”由 SQL 书写
+    决定、无法从列上推导，因此显式保存：限定投影与 JOIN 的 SELECT * 取
+    `限定符.列名`，其余取原列名。
     """
 
     columns: tuple[BoundColumnRef, ...]
+    output_names: tuple[str, ...]
     child: LogicalPlan
 
     def __post_init__(self) -> None:
+        # 先校验等长：否则 output_schema 按 output_names 取名会抛 IndexError
+        if len(self.output_names) != len(self.columns):
+            raise SqlError(
+                E_TYPE_MISMATCH,
+                f"projection output name count: {len(self.output_names)} != "
+                f"{len(self.columns)}",
+            )
         schema = self.child.output_schema
         for col in self.columns:
             _check_column(col.column, schema)
@@ -95,18 +122,67 @@ class LogicalProjection(LogicalPlan):
 
     @property
     def output_schema(self) -> LogicalSchema:
-        # 输出列沿用原表/名/类型，位置从 0 重新编号
+        # 输出列沿用来源的 table/qualifier/type，表头取 output_names，位置从 0 重新编号
         return LogicalSchema(
             tuple(
                 LogicalColumn(
                     table=col.column.table,
-                    name=col.column.name,
+                    qualifier=col.column.qualifier,
+                    name=self.output_names[i],
                     index=i,
                     type=col.column.type,
                 )
                 for i, col in enumerate(self.columns)
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalJoin(LogicalPlan):
+    """INNER JOIN：左右子树按左列在前、右列在后的顺序拼接。
+
+    不变式：
+    - schema 恒等于 join_schema(left, right)；左右限定符相交时 join_schema 抛
+      E_DUP_TABLE_ALIAS，因此本节点是重复别名的兜底检查点；
+    - on 顶层恒为 BoundLogical(AND) 且 terms 非空，每个 conjunct 结果为 BOOLEAN；
+    - on 中的列引用都必须在 schema 中按 index 定位。
+    链式 JOIN 按书写顺序构造左深树，某个 on 只绑定在“左侧累积 Schema + 当前右表”上。
+    """
+
+    left: LogicalPlan
+    right: LogicalPlan
+    on: BoundExpr
+    schema: LogicalSchema
+    kind: JoinType = JoinType.INNER
+
+    def __post_init__(self) -> None:
+        # 先校验 Schema 契约：这样后续按 index 定位 on 中的列时，诊断信息才可信
+        if self.schema != join_schema(self.left.output_schema, self.right.output_schema):
+            raise SqlError(
+                E_TYPE_MISMATCH,
+                "join schema must equal join_schema(left.output_schema, "
+                "right.output_schema)",
+            )
+        if (
+            not isinstance(self.on, BoundLogical)
+            or self.on.op is not LogicOp.AND
+            or not self.on.terms
+        ):
+            raise SqlError(
+                E_TYPE_MISMATCH,
+                "join predicate must be a non-empty AND conjunction",
+            )
+        _check_expr_columns(self.on, self.schema)
+        for term in self.on.terms:
+            require_boolean(term, "JOIN ON")
+
+    @property
+    def children(self) -> tuple[LogicalPlan, ...]:
+        return (self.left, self.right)
+
+    @property
+    def output_schema(self) -> LogicalSchema:
+        return self.schema
 
 
 # ---------- 数据库命令节点 ----------
@@ -297,19 +373,20 @@ def _scan_under(plan: LogicalPlan) -> LogicalScan:
 
 
 def _check_column(column: LogicalColumn, schema: LogicalSchema) -> None:
-    """校验一个列引用能在 schema 中按 index 定位，且名称、类型一致。"""
+    """校验一个列引用能在 schema 中按 index 定位，且限定符、表名、列名、类型一致。"""
     if not 0 <= column.index < len(schema.columns):
         raise SqlError(E_COLUMN_NOT_FOUND, f"column not found: {column.name}")
     expect = schema.columns[column.index]
     if (
         expect.table != column.table
+        or expect.qualifier != column.qualifier
         or expect.name != column.name
         or expect.type != column.type
     ):
         raise SqlError(
             E_TYPE_MISMATCH,
-            f"bound column mismatch: {column.table}.{column.name}@"
-            f"{column.index}({column.type.value}) vs schema {expect.table}."
+            f"bound column mismatch: {column.qualifier}.{column.name}@"
+            f"{column.index}({column.type.value}) vs schema {expect.qualifier}."
             f"{expect.name}({expect.type.value})",
         )
 

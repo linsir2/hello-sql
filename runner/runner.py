@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from time import perf_counter
 
-from contracts.ast import Statement
-from contracts.result import QueryResult
+from contracts.ast import ParsedStatement, Script, SourceSpan, Statement
+from contracts.errors import E_INPUT_FILE, SqlError
+from contracts.result import QueryResult, ScriptResult, StatementResult
 from contracts.storage import BaseDatabaseServer, TableInfo
 from runner.executor.builder import ExecutorTreeBuilder
 from runner.executor.context import ExecutionContext
@@ -15,6 +17,7 @@ from runner.logical_plan.builder import LogicalPlanBuilder
 
 DEFAULT_DATABASE = "main"
 ParseSql = Callable[[str], Statement]
+ParseScript = Callable[[str], Script]
 
 
 class Runner:
@@ -25,10 +28,12 @@ class Runner:
         server: BaseDatabaseServer,
         parse: ParseSql,
         current_database: str = DEFAULT_DATABASE,
+        parse_script: ParseScript | None = None,
     ) -> None:
         # 先完成连接；连接失败时不创建半初始化的会话上下文。
         storage = server.connect(current_database)
         self._parse = parse
+        self._parse_script = parse_script or self._parse_as_single_statement_script
         self._context = ExecutionContext(
             server=server,
             storage=storage,
@@ -51,9 +56,102 @@ class Runner:
     def execute(self, sql: str) -> QueryResult:
         """执行一条 SQL，并原样返回执行器产生的结果。"""
         statement = self._parse(sql)
+        return self._execute_statement(statement)
+
+    def _execute_statement(self, statement: Statement) -> QueryResult:
+        """执行已解析的单条语句，避免脚本路径重复解析原 SQL。"""
         plan = self._logical_plan_builder.build(statement)
         executor = self._executor_tree_builder.build(plan)
         return executor.execute(self._context)
+
+    def _parse_as_single_statement_script(self, sql: str) -> Script:
+        """在未注入 parse_script 时为旧调用方提供单语句兼容。
+
+        该适配只能解析一条语句；需要多语句能力时应向 Runner
+        显式注入 compiler.parse_script。
+        """
+        if not sql.strip():
+            return ()
+        statement = self._parse(sql)
+        start_offset = next(
+            index for index, character in enumerate(sql) if not character.isspace()
+        )
+        end_offset = len(sql.rstrip())
+        start_line, start_col = self._source_position(sql, start_offset)
+        end_line, end_col = self._source_position(sql, end_offset - 1)
+        return (
+            ParsedStatement(
+                statement=statement,
+                sql=sql[start_offset:end_offset],
+                span=SourceSpan(start_line, start_col, end_line, end_col),
+            ),
+        )
+
+    @staticmethod
+    def _source_position(source: str, offset: int) -> tuple[int, int]:
+        """把零基字符偏移转换为一基行列位置。"""
+        prefix = source[:offset]
+        line = prefix.count("\n") + 1
+        last_newline = prefix.rfind("\n")
+        column = offset + 1 if last_newline < 0 else offset - last_newline
+        return line, column
+
+    def execute_script(
+        self,
+        sql: str,
+        *,
+        stop_on_error: bool = True,
+    ) -> ScriptResult:
+        """按源码顺序执行脚本中的语句并汇总逐条结果。
+
+        整段脚本先由 parse_script 解析；解析错误直接向调用方抛出。
+        stop_on_error 只控制名称绑定和执行阶段的 SqlError。
+        """
+        parsed_statements = self._parse_script(sql)
+        results: list[StatementResult] = []
+        stopped_early = False
+
+        for parsed in parsed_statements:
+            started = perf_counter()
+            try:
+                result = self._execute_statement(parsed.statement)
+            except SqlError as error:
+                results.append(
+                    StatementResult(
+                        sql=parsed.sql,
+                        span=parsed.span,
+                        error=error,
+                        elapsed_ms=(perf_counter() - started) * 1000,
+                    )
+                )
+                if stop_on_error:
+                    stopped_early = True
+                    break
+            else:
+                results.append(
+                    StatementResult(
+                        sql=parsed.sql,
+                        span=parsed.span,
+                        result=result,
+                        elapsed_ms=(perf_counter() - started) * 1000,
+                    )
+                )
+
+        return ScriptResult(tuple(results), stopped_early=stopped_early)
+
+    def execute_file(
+        self,
+        path: str | Path,
+        *,
+        stop_on_error: bool = True,
+    ) -> ScriptResult:
+        """按 UTF-8 读取 SQL 文件并交给 execute_script 执行。"""
+        try:
+            input_path = Path(path).expanduser()
+            sql = input_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError, TypeError, ValueError) as error:
+            raise SqlError(E_INPUT_FILE, f"cannot read SQL file {path!s}: {error}") from None
+        return self.execute_script(sql, stop_on_error=stop_on_error)
 
     def list_databases(self) -> list[str]:
         """向终端提供库名，终端不接触存储内部结构。"""
@@ -67,12 +165,18 @@ class Runner:
 
     def repl(
         self, *, data_dir: Path | None = None, plain: bool = False,
-        history: bool = True,
+        history: bool = True, stop_on_error: bool = True,
     ) -> int:
         """进入终端会话；非 TTY 自动使用纯文本，返回会话退出码。"""
         from runner.terminal.session import TerminalSession
 
-        return TerminalSession(self, data_dir=data_dir, plain=plain, history=history).run()
+        return TerminalSession(
+            self,
+            data_dir=data_dir,
+            plain=plain,
+            history=history,
+            stop_on_error=stop_on_error,
+        ).run()
 
     @staticmethod
     def _print_result(result: QueryResult) -> None:

@@ -2,7 +2,7 @@
 
 - base.py：LogicalColumn、LogicalSchema、LogicalPlan 基类；
 - expressions.py：绑定表达式（Bound* 节点、bind_expr、求值）；
-- plans.py：V1 计划节点；
+- plans.py：计划节点（Scan/Filter/Projection/Join 与 DDL/DML）；
 - builder.py：Statement -> 计划树；
 """
 
@@ -11,10 +11,10 @@ from runner.logical_plan.base import (
     LogicalColumn,
     LogicalPlan,
     LogicalSchema,
+    join_schema,
 )
 from runner.logical_plan.builder import DescribeTable, LogicalPlanBuilder
 from runner.logical_plan.expressions import (
-    BOOLEAN,
     ArithOp,
     BoundArith,
     BoundAssignment,
@@ -27,7 +27,6 @@ from runner.logical_plan.expressions import (
     BoundUnaryNot,
     ComparisonOp,
     LogicOp,
-    TypeKind,
     arith_eval,
     bind_conjunction,
     bind_expr,
@@ -38,6 +37,7 @@ from runner.logical_plan.expressions import (
     deduce_type,
     eval_expr,
     normalize_literal,
+    require_boolean,
 )
 from runner.logical_plan.plans import (
     LogicalCreateDatabase,
@@ -47,6 +47,7 @@ from runner.logical_plan.plans import (
     LogicalDropTable,
     LogicalFilter,
     LogicalInsert,
+    LogicalJoin,
     LogicalProjection,
     LogicalScan,
     LogicalUpdate,
@@ -59,12 +60,11 @@ __all__ = [
     "LogicalColumn",
     "LogicalPlan",
     "LogicalSchema",
+    "join_schema",
     # builder
     "DescribeTable",
     "LogicalPlanBuilder",
     # expressions
-    "BOOLEAN",
-    "TypeKind",
     "ArithOp",
     "BoundArith",
     "BoundAssignment",
@@ -87,6 +87,7 @@ __all__ = [
     "deduce_type",
     "eval_expr",
     "normalize_literal",
+    "require_boolean",
     # plans
     "LogicalCreateDatabase",
     "LogicalCreateTable",
@@ -95,6 +96,7 @@ __all__ = [
     "LogicalDropTable",
     "LogicalFilter",
     "LogicalInsert",
+    "LogicalJoin",
     "LogicalProjection",
     "LogicalScan",
     "LogicalUpdate",

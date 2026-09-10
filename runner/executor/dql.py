@@ -1,7 +1,8 @@
-"""DQL 执行器：把 LogicalProjection/Filter/Scan 计划树转换为拉取式行流水线。
+"""DQL 执行器：把 Projection/Filter/Join/Scan 计划树转换为拉取式行流水线。
 
 - SeqScanExecutor：读取 Storage 的整表行；
 - FilterExecutor：按谓词过滤，命中行原样下传；
+- NestedLoopJoinExecutor：拼接左右行并按 ON 谓词筛选；
 - ProjectionExecutor：按投影列重排行值；
 - SelectExecutor：把行流水线物化为 QueryResult。
 """
@@ -17,7 +18,12 @@ from runner.executor.context import ExecutionContext
 from runner.executor.row import ExecRow
 from runner.logical_plan.base import LogicalPlan, LogicalSchema
 from runner.logical_plan.expressions import BoundColumnRef, BoundExpr, eval_expr
-from runner.logical_plan.plans import LogicalFilter, LogicalProjection, LogicalScan
+from runner.logical_plan.plans import (
+    LogicalFilter,
+    LogicalJoin,
+    LogicalProjection,
+    LogicalScan,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +59,34 @@ class FilterExecutor(RowExecutor):
         for row in self.child.rows(context):
             if eval_expr(self.predicate, row.values):
                 yield row
+
+
+@dataclass(frozen=True, slots=True)
+class NestedLoopJoinExecutor(RowExecutor):
+    """INNER JOIN 行算子：左侧流式拉取，右侧在每次执行时物化一次。
+
+    左右行的 values 按 Schema 约定直接拼接，ON 中的列索引因此可以
+    直接作用于拼接行。JOIN 只出现在 SELECT 计划中，输出行沿用左行的
+    row_id 仅为了继续通过通用行流水线，不会被解释为 JOIN 结果的物理行标识。
+    """
+
+    left: RowExecutor
+    right: RowExecutor
+    on: BoundExpr
+    schema: LogicalSchema
+
+    @property
+    def output_schema(self) -> LogicalSchema:
+        return self.schema
+
+    def rows(self, context: ExecutionContext) -> Iterator[ExecRow]:
+        # 右侧只执行一次，避免为每个左行重复扫描 Storage。
+        right_rows = tuple(self.right.rows(context))
+        for left_row in self.left.rows(context):
+            for right_row in right_rows:
+                values = left_row.values + right_row.values
+                if eval_expr(self.on, values):
+                    yield ExecRow(row_id=left_row.row_id, values=values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +146,13 @@ def build_row_executor(plan: LogicalPlan) -> RowExecutor:
             return FilterExecutor(
                 predicate=plan.predicate,
                 child=build_row_executor(plan.child),
+            )
+        case LogicalJoin():
+            return NestedLoopJoinExecutor(
+                left=build_row_executor(plan.left),
+                right=build_row_executor(plan.right),
+                on=plan.on,
+                schema=plan.output_schema,
             )
         case LogicalProjection():
             return ProjectionExecutor(

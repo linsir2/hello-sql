@@ -19,6 +19,7 @@ from runner.executor.dml import (
 )
 from runner.executor.dql import (
     FilterExecutor,
+    NestedLoopJoinExecutor,
     ProjectionExecutor,
     SelectExecutor,
     SeqScanExecutor,
@@ -36,6 +37,7 @@ __all__ = [
     # DQL
     "SeqScanExecutor",
     "FilterExecutor",
+    "NestedLoopJoinExecutor",
     "ProjectionExecutor",
     "SelectExecutor",
     "build_row_executor",
