@@ -8,8 +8,9 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 import sys
 
-from compiler import parse
+from compiler import parse, parse_script
 from contracts.errors import SqlError
+from contracts.result import ScriptResult
 from runner import Runner
 from storage import DatabaseServer
 
@@ -23,7 +24,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--plain", action="store_true", help="使用纯文本交互，关闭艺术字和颜色")
     parser.add_argument("--no-history", action="store_true", help="不读取或保存磁盘输入历史")
-    parser.add_argument("-e", "--execute", metavar="SQL", help="执行一条 SQL 后退出")
+    execution = parser.add_mutually_exclusive_group()
+    execution.add_argument("-e", "--execute", metavar="SQL", help="执行 SQL 或多语句脚本后退出")
+    execution.add_argument("-f", "--file", type=Path, metavar="PATH", help="按 UTF-8 执行 SQL 文件后退出")
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="多语句执行时记录错误并继续",
+    )
     try:
         app_version = version("hello-sql")
     except PackageNotFoundError:
@@ -40,21 +48,64 @@ def resolve_data_dir(argument: Path | None) -> Path:
     return path.expanduser().resolve()
 
 
+def print_script_result(runner: Runner, result: ScriptResult, *, rich: bool) -> int:
+    """展示脚本汇总结果，有任一语句失败时返回非零退出码。"""
+    if rich:
+        from runner.terminal.render import TerminalRenderer
+
+        TerminalRenderer().script_result(result)
+    else:
+        from runner.terminal.render import safe_text
+
+        for statement in result.statements:
+            if statement.result is not None:
+                runner._print_result(statement.result)
+            else:
+                assert statement.error is not None
+                print(
+                    f"[{statement.error.code}] {safe_text(statement.error.message)}",
+                    file=sys.stderr,
+                )
+    return int(any(statement.error is not None for statement in result.statements))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         data_dir = resolve_data_dir(args.data_dir)
         server = DatabaseServer(data_dir)
-        runner = Runner(server=server, parse=parse, current_database=args.database.lower())
+        runner = Runner(
+            server=server,
+            parse=parse,
+            parse_script=parse_script,
+            current_database=args.database.lower(),
+        )
         if args.execute is not None:
-            result = runner.execute(args.execute)
-            if sys.stdout.isatty() and not args.plain:
-                from runner.terminal.render import TerminalRenderer
-                TerminalRenderer().result(result)
-            else:
-                runner._print_result(result)
-            return 0
-        return runner.repl(data_dir=data_dir, plain=args.plain, history=not args.no_history)
+            result = runner.execute_script(
+                args.execute,
+                stop_on_error=not args.continue_on_error,
+            )
+            return print_script_result(
+                runner,
+                result,
+                rich=sys.stdout.isatty() and not args.plain,
+            )
+        if args.file is not None:
+            result = runner.execute_file(
+                args.file.expanduser(),
+                stop_on_error=not args.continue_on_error,
+            )
+            return print_script_result(
+                runner,
+                result,
+                rich=sys.stdout.isatty() and not args.plain,
+            )
+        return runner.repl(
+            data_dir=data_dir,
+            plain=args.plain,
+            history=not args.no_history,
+            stop_on_error=not args.continue_on_error,
+        )
     except SqlError as error:
         # Literal text: do not interpret error contents as terminal markup.
         from runner.terminal.render import safe_text

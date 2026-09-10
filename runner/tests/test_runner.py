@@ -14,13 +14,14 @@ from contracts.ast import (
     InsertStmt,
     SelectStmt,
     SqlType,
+    SourceSpan,
     Statement,
     TableRef,
     UseDatabaseStmt,
     Value,
 )
 from contracts.errors import E_DATABASE_NOT_FOUND, SqlError
-from contracts.result import QueryResult
+from contracts.result import QueryResult, ScriptResult, StatementResult
 from contracts.storage import Row, RowId, TableInfo
 from runner import Runner
 
@@ -221,13 +222,23 @@ class RunnerTest(unittest.TestCase):
             QueryResult(affected_rows=2),
         ]
 
-        def execute(sql: str) -> QueryResult:
+        def execute_script(sql: str, *, stop_on_error: bool = True) -> ScriptResult:
             result = results.pop(0)
             if isinstance(result, SqlError):
-                raise result
-            return result
+                statement = StatementResult(
+                    sql=sql,
+                    span=SourceSpan(1, 1, 1, len(sql)),
+                    error=result,
+                )
+            else:
+                statement = StatementResult(
+                    sql=sql,
+                    span=SourceSpan(1, 1, 1, len(sql)),
+                    result=result,
+                )
+            return ScriptResult((statement,))
 
-        runner.execute = execute  # type: ignore[method-assign]
+        runner.execute_script = execute_script  # type: ignore[method-assign]
         output = io.StringIO()
         with (
             patch("builtins.input", side_effect=["bad", "select", "update", EOFError]),

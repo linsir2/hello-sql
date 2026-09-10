@@ -15,7 +15,7 @@ from prompt_toolkit.document import Document
 from rich.cells import cell_len
 from rich.console import Console
 
-from compiler import parse
+from compiler import parse, parse_script
 from contracts.result import QueryResult
 from main import main, resolve_data_dir
 from runner import Runner
@@ -92,7 +92,7 @@ def test_help_and_version_do_not_create_data(tmp_path, monkeypatch, capsys):
 
 
 def test_completion_tracks_current_database(tmp_path):
-    runner = Runner(DatabaseServer(tmp_path), parse)
+    runner = Runner(DatabaseServer(tmp_path), parse, parse_script=parse_script)
     runner.execute("CREATE TABLE local_table (id INT)")
     runner.execute("CREATE DATABASE shop")
     completer = SqlCompleter(runner)
@@ -137,7 +137,7 @@ def test_art_is_rendered_in_true_color():
 
 
 def test_interactive_ctrl_c_error_recovery_and_updated_prompt(tmp_path):
-    runner = Runner(DatabaseServer(tmp_path), parse)
+    runner = Runner(DatabaseServer(tmp_path), parse, parse_script=parse_script)
     session = TerminalSession(runner, data_dir=tmp_path, history=False)
     session.interactive = True
     stream = io.StringIO()
@@ -168,3 +168,100 @@ def test_installed_command_can_run_outside_repository(tmp_path):
     result = subprocess.run([str(command), "--version"], cwd=tmp_path, text=True, capture_output=True, timeout=15)
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("hello-sql ")
+
+
+def test_cli_execute_accepts_multiple_statements(tmp_path):
+    result = run_cli(
+        tmp_path,
+        "-e",
+        "CREATE TABLE flags (id INT, enabled BOOLEAN); "
+        "INSERT INTO flags VALUES (1, TRUE); "
+        "SELECT * FROM flags WHERE enabled;",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "id\tenabled\n1\tTrue\n" in result.stdout
+
+
+def test_cli_and_terminal_command_execute_utf8_sql_file(tmp_path):
+    cli_file = tmp_path / "cli demo.sql"
+    cli_file.write_text(
+        "CREATE TABLE cli_notes (id INT, body TEXT);\n"
+        "INSERT INTO cli_notes VALUES (1, '你好');\n"
+        "SELECT *\nFROM cli_notes;\n",
+        encoding="utf-8",
+    )
+    cli_root = tmp_path / "cli"
+    cli_root.mkdir()
+    cli = run_cli(cli_root, "-f", str(cli_file))
+    assert cli.returncode == 0, cli.stderr
+    assert "id\tbody\n1\t你好\n" in cli.stdout
+
+    tui_file = tmp_path / "tui demo.sql"
+    tui_file.write_text(
+        "CREATE TABLE tui_notes (id INT, body TEXT);\n"
+        "INSERT INTO tui_notes VALUES (2, '文件执行');\n"
+        "SELECT * FROM tui_notes;\n",
+        encoding="utf-8",
+    )
+    terminal_root = tmp_path / "terminal"
+    terminal_root.mkdir()
+    terminal = run_cli(
+        terminal_root,
+        sql=f'/file "{tui_file}"\n/quit\n',
+    )
+    assert terminal.returncode == 0, terminal.stderr
+    assert "id\tbody\n2\t文件执行\n" in terminal.stdout
+
+
+def test_terminal_continue_on_error_executes_later_file_statements(tmp_path):
+    sql_file = tmp_path / "continue.sql"
+    sql_file.write_text(
+        "CREATE TABLE values_table (id INT);\n"
+        "INSERT INTO values_table VALUES ('bad');\n"
+        "INSERT INTO values_table VALUES (7);\n"
+        "SELECT * FROM values_table;\n",
+        encoding="utf-8",
+    )
+
+    result = run_cli(
+        tmp_path,
+        sql=f'/stop-on-error off\n/file "{sql_file}"\n/quit\n',
+    )
+
+    assert result.returncode == 1
+    assert "stop-on-error = off" in result.stdout
+    assert "[E_TYPE_MISMATCH]" in result.stdout
+    assert "id\n7\n" in result.stdout
+
+
+def test_interactive_prompt_executes_multiline_multistatement_buffer(tmp_path):
+    runner = Runner(DatabaseServer(tmp_path), parse, parse_script=parse_script)
+    session = TerminalSession(runner, data_dir=tmp_path, history=False)
+    session.interactive = True
+    stream = io.StringIO()
+    session.renderer = TerminalRenderer(Console(file=stream, width=120, color_system=None))
+    script = (
+        "CREATE TABLE entries (id INT, enabled BOOLEAN);\n"
+        "INSERT INTO entries VALUES (1, TRUE);\n"
+        "SELECT *\nFROM entries\nWHERE enabled;"
+    )
+    answers = iter([script, EOFError()])
+
+    class FakePrompt:
+        def prompt(self, message):
+            value = next(answers)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+    with (
+        patch.object(session, "_make_prompt", return_value=FakePrompt()),
+        patch("sys.stdin.isatty", return_value=True),
+    ):
+        assert session.run() == 0
+
+    assert runner.execute("SELECT * FROM entries;").rows == ((1, True),)
+    output = stream.getvalue()
+    assert "#1/3" in output
+    assert "#3/3" in output
