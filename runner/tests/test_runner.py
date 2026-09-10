@@ -15,6 +15,7 @@ from contracts.ast import (
     SelectStmt,
     SqlType,
     Statement,
+    TableRef,
     UseDatabaseStmt,
     Value,
 )
@@ -162,7 +163,7 @@ class RunnerTest(unittest.TestCase):
             {
                 "USE shop;": UseDatabaseStmt("shop"),
                 "INSERT": InsertStmt("items", (7,)),
-                "SELECT": SelectStmt(None, "items", None),
+                "SELECT": SelectStmt(None, TableRef("items"), None),
             }
         )
         runner = Runner(server, parser)

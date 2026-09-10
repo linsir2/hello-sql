@@ -3,10 +3,9 @@ from __future__ import annotations
 from abc import ABC
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal as TyLiteral, TypeAlias
 
-from contracts.ast import And, Column, Cmp, Expr, Literal, SqlType, Value
-from contracts.errors import E_TYPE_MISMATCH, SqlError
+from contracts.ast import And, Column, Cmp, Expr, Literal, Not, Or, SqlType, Value
+from contracts.errors import E_BOOLEAN_REQUIRED, E_TYPE_MISMATCH, SqlError
 
 from runner.logical_plan.base import LogicalColumn, LogicalSchema
 
@@ -36,15 +35,6 @@ class LogicOp(Enum):
     OR = "OR"
 
 
-# ---------- 类型推导标记 ----------
-
-# 布尔结果在 bound 内部的标记。契约 SqlType 只有 INT/TEXT/REAL，
-# BOOLEAN 只用于 deduce_type 的返回值，不落字段、不流向存储层与投影。
-BOOLEAN: TyLiteral["BOOLEAN"] = "BOOLEAN"
-
-TypeKind: TypeAlias = SqlType | TyLiteral["BOOLEAN"]
-
-
 # ---------- 节点 ----------
 
 
@@ -54,7 +44,7 @@ class BoundExpr(ABC):
 
 @dataclass(frozen=True, slots=True)
 class BoundColumnRef(BoundExpr):
-    """列引用：已绑定表名、列名、行位置与类型。"""
+    """列引用：已绑定来源表、限定符、列名、行位置与类型。"""
 
     column: LogicalColumn
 
@@ -69,7 +59,7 @@ class BoundLiteral(BoundExpr):
 
 @dataclass(frozen=True, slots=True)
 class BoundComparison(BoundExpr):
-    """比较：两侧均为任意 BoundExpr（当前实际输入仅 列 op 字面量）。"""
+    """比较：两侧类型在绑定期已协调一致，支持 INT、REAL、TEXT、BOOLEAN"""
 
     left: BoundExpr
     op: ComparisonOp
@@ -78,7 +68,7 @@ class BoundComparison(BoundExpr):
 
 @dataclass(frozen=True, slots=True)
 class BoundLogical(BoundExpr):
-    """逻辑连接：AND/OR。terms 非空；允许嵌套 BoundLogical（当前仅 AND 可达）。"""
+    """逻辑连接：AND/OR。terms 非空，每项结果为 BOOLEAN。"""
 
     op: LogicOp
     terms: tuple[BoundExpr, ...]
@@ -86,7 +76,7 @@ class BoundLogical(BoundExpr):
 
 @dataclass(frozen=True, slots=True)
 class BoundUnaryNot(BoundExpr):
-    """TODO：逻辑非：预留节点，等待 AST 契约升级后接入，本版无输入。"""
+    """逻辑非：operand 结果必须为 BOOLEAN。"""
 
     operand: BoundExpr
 
@@ -119,15 +109,15 @@ class BoundAssignment:
 # ---------- 类型推导 ----------
 
 
-def deduce_type(expr: BoundExpr) -> TypeKind:
-    """推导表达式的结果类型。布尔结果返回内部标记 BOOLEAN（不是 SqlType）。"""
+def deduce_type(expr: BoundExpr) -> SqlType:
+    """推导表达式的结果类型。"""
     match expr:
         case BoundColumnRef():
             return expr.column.type
         case BoundLiteral():
             return expr.type
         case BoundComparison() | BoundLogical() | BoundUnaryNot():
-            return BOOLEAN
+            return SqlType.BOOLEAN
         case BoundArith():
             # 算术左右在绑定期已协调为同型（INT 或 REAL），任取一侧即可
             return deduce_type(expr.left)
@@ -135,12 +125,12 @@ def deduce_type(expr: BoundExpr) -> TypeKind:
             return expr.target
 
 
-def _type_name(kind: TypeKind) -> str:
+def _type_name(kind: SqlType) -> str:
     """类型名（错误消息用）。"""
-    return kind.value if isinstance(kind, SqlType) else kind
+    return kind.value
 
 
-def _is_numeric(kind: TypeKind) -> bool:
+def _is_numeric(kind: SqlType) -> bool:
     return kind is SqlType.INT or kind is SqlType.REAL
 
 
@@ -148,10 +138,10 @@ def _is_numeric(kind: TypeKind) -> bool:
 
 
 def bind_literal(value: Value) -> BoundLiteral:
-    """TODO：无目标类型上下文时，按 Python 值自然推断字面量类型（bool 明确拒绝）。"""
-    if isinstance(value, bool):
-        # TODO：BOOLEAN 类型在 V1 暂时不支持，后续需扩展
-        raise SqlError(E_TYPE_MISMATCH, "bool is not a valid INT/REAL value")
+    """无目标类型上下文时，按 Python 值自然推断字面量类型。"""
+    # bool 是 int 子类，必须先于 int 判断
+    if type(value) is bool:
+        return BoundLiteral(value, SqlType.BOOLEAN)
     if isinstance(value, int):
         return BoundLiteral(value, SqlType.INT)
     if isinstance(value, float):
@@ -165,20 +155,20 @@ def bind_literal(value: Value) -> BoundLiteral:
 def normalize_literal(value: Value, target: SqlType) -> BoundLiteral:
     """按目标类型校验并规范化字面量（INSERT/UPDATE 值与比较字面量通用）。
 
-    V1 规则表：INT 收 int（拒绝 bool）；TEXT 收 str；REAL 收 int/float 并
-    存 float。
+    规则表：BOOLEAN 收 bool；INT 收 int；TEXT 收 str；
+    REAL 收 int/float 并存 float。
     """
-    # TODO：BOOLEAN 类型在 V1 暂时不支持，后续需扩展
-    if isinstance(value, bool):
-        raise SqlError(E_TYPE_MISMATCH, f"bool is not a valid {target.value} value")
-    if target == SqlType.INT:
-        if isinstance(value, int):
+    if target == SqlType.BOOLEAN:
+        if type(value) is bool:
+            return BoundLiteral(value, target)
+    elif target == SqlType.INT:
+        if isinstance(value, int) and not isinstance(value, bool):
             return BoundLiteral(value, target)
     elif target == SqlType.TEXT:
         if isinstance(value, str):
             return BoundLiteral(value, target)
     elif target == SqlType.REAL:
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
             return BoundLiteral(float(value), target)
     raise SqlError(
         E_TYPE_MISMATCH, f"value {value!r} is not a valid {target.value} value"
@@ -207,11 +197,12 @@ def _coerce_to(expr: BoundExpr, target: SqlType) -> BoundExpr:
 def coerce(left: BoundExpr, right: BoundExpr) -> tuple[BoundExpr, BoundExpr]:
     """比较两侧类型，在必要时进行类型转换，保证两侧类型一致。
 
-    TODO：目前仅支持 INT 与 REAL 的数值类型协调。
     ## Rules：
     - 同型：原样返回（TEXT/TEXT、INT/INT 与 BOOLEAN/BOOLEAN）；
     - 一侧 INT 一侧 REAL：INT 侧提升为 REAL（数值提升）；
-    - 其余组合：E_TYPE_MISMATCH（如 TEXT 与数值比较）。
+    - 其余组合：E_TYPE_MISMATCH（如 TEXT 与数值、BOOLEAN 与数值比较）。
+
+    两侧同型为 BOOLEAN 时是否允许当前操作符，由调用方（Cmp 绑定）判定。
     """
     lt, rt = deduce_type(left), deduce_type(right)
     if lt == rt:
@@ -227,46 +218,91 @@ def coerce(left: BoundExpr, right: BoundExpr) -> tuple[BoundExpr, BoundExpr]:
 # ---------- AST 表达式绑定 ----------
 
 
+def require_boolean(expr: BoundExpr, context: str) -> None:
+    """要求表达式结果为 BOOLEAN，否则抛 E_BOOLEAN_REQUIRED。"""
+    kind = deduce_type(expr)
+    if kind is not SqlType.BOOLEAN:
+        raise SqlError(
+            E_BOOLEAN_REQUIRED,
+            f"{context} requires BOOLEAN, got {_type_name(kind)}",
+        )
+
+
+def _bind_comparison(node: Cmp, schema: LogicalSchema) -> BoundComparison:
+    """绑定比较：先协调两侧类型，再按操作符校验可比性。
+
+    布尔只支持 = 与 <>，大小比较属于类型不匹配，不新增错误码。
+    """
+    left = bind_expr(node.left, schema)
+    right = bind_expr(node.right, schema)
+    left, right = coerce(left, right)
+    op = ComparisonOp(node.op)
+    # 协调后两侧必然同型，因此只需判断「同型为 BOOLEAN 且非 = / <>」
+    if deduce_type(left) is SqlType.BOOLEAN and op not in (
+        ComparisonOp.EQ,
+        ComparisonOp.NE,
+    ):
+        raise SqlError(
+            E_TYPE_MISMATCH, f"boolean value is not orderable: {op.value}"
+        )
+    return BoundComparison(left, op, right)
+
+
 def bind_expr(node: Expr, schema: LogicalSchema) -> BoundExpr:
     """把 AST 表达式绑定到输入 Schema，完成列解析与类型协调。
 
-    当前可达分支：Column / Literal / Cmp（列 op 字面量）/ And（展平）。
-    TODO：OR / NOT / 算术 / 显式 CAST 的分支等待 AST 契约升级后在此接入；
-    到达即抛 E_TYPE_MISMATCH，不作静默降级。
+    覆盖契约 Expr 的全部六种节点：Column / Literal / Cmp / And / Or / Not。
     """
     match node:
         case Column():
-            return BoundColumnRef(schema.column(node.name))
+            # 限定符存在时按来源解析，未限定走「恰好唯一」匹配
+            return BoundColumnRef(schema.resolve(node.name, node.qualifier))
         case Literal():
             return bind_literal(node.value)
         case Cmp():
-            left = bind_expr(node.left, schema)
-            right = bind_expr(node.right, schema)
-            left, right = coerce(left, right)
-            return BoundComparison(left, ComparisonOp(node.op), right)
+            return _bind_comparison(node, schema)
         case And():
-            terms = [bind_expr(leaf, schema) for leaf in _flatten_and(node)]
+            terms = [bind_expr(leaf, schema) for leaf in _flatten(node, And)]
+            for term in terms:
+                require_boolean(term, "AND")
             return BoundLogical(LogicOp.AND, tuple(terms))
+        case Or():
+            terms = [bind_expr(leaf, schema) for leaf in _flatten(node, Or)]
+            for term in terms:
+                require_boolean(term, "OR")
+            return BoundLogical(LogicOp.OR, tuple(terms))
+        case Not():
+            operand = bind_expr(node.operand, schema)
+            require_boolean(operand, "NOT")
+            return BoundUnaryNot(operand)
         case _:
-            # TODO：预留分支未接入。
+            # 契约 Expr 之外的节点：显式报错，不作静默降级。
             raise SqlError(
                 E_TYPE_MISMATCH, f"unsupported expression: {type(node).__name__}"
             )
 
 
 def bind_conjunction(node: Expr, schema: LogicalSchema) -> BoundLogical:
-    """WHERE 绑定入口"""
+    """WHERE / ON 绑定入口：返回顶层为 AND 的 conjunct 列表信封。
+
+    顶层是 AND 时保留展平结果；顶层是 OR / NOT / 比较 / 布尔列 / 布尔字面量
+    时包一层单元素 AND，使 predicate.terms 恒为可直接下推的 conjunct 列表。
+    """
     bound = bind_expr(node, schema)
-    if isinstance(bound, BoundLogical):
-        return bound
-    # 如果绑定结果不是 BoundLogical，则说明为单层条件（不含 AND/OR 组合），也需要包一层 BoundLogical，且为 AND 类型。
-    return BoundLogical(LogicOp.AND, (bound,))
+    if not (isinstance(bound, BoundLogical) and bound.op is LogicOp.AND):
+        bound = BoundLogical(LogicOp.AND, (bound,))
+    for term in bound.terms:
+        require_boolean(term, "WHERE/ON")
+    return bound
 
 
-def _flatten_and(node: Expr) -> list[Expr]:
-    """把 AST 的 And 二叉树展平为叶子列表，保持从左到右顺序。"""
-    if isinstance(node, And):
-        return _flatten_and(node.left) + _flatten_and(node.right)
+def _flatten(node: Expr, node_type: type[And] | type[Or]) -> list[Expr]:
+    """把 AST 中同层同类型的逻辑节点展平为叶子列表，保持从左到右顺序。
+
+    只展平 node_type 这一种节点：And 里的 Or 保持原样，反之亦然。
+    """
+    if isinstance(node, (And, Or)) and isinstance(node, node_type):
+        return _flatten(node.left, node_type) + _flatten(node.right, node_type)
     return [node]
 
 
@@ -295,7 +331,7 @@ def eval_expr(expr: BoundExpr, row: tuple[Value, ...]) -> Value:
                     return False
             return True
         case BoundLogical(op=LogicOp.OR):
-            # TODO：短路：遇 True 立即返回（当前无输入，等契约升级）
+            # 短路：遇 True 立即返回
             for term in expr.terms:
                 if eval_expr(term, row):
                     return True
