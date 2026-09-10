@@ -219,13 +219,23 @@ class DatabaseServer:
             catalog = load_or_migrate(main_dir, self._pool)
             self._catalogs[main_dir.absolute()] = catalog
         else:
+            created = False
             try:
                 main_dir.mkdir()
+                created = True
+                create_empty_system_catalog(main_dir)
+                catalog = Catalog(main_dir, self._pool)
+                catalog.load()
+            except SqlError:
+                if created:
+                    shutil.rmtree(main_dir, ignore_errors=True)
+                raise
             except OSError as exc:
-                raise SqlError(E_STORAGE, f"cannot create main db dir: {main_dir}") from exc
-            create_empty_system_catalog(main_dir)
-            catalog = Catalog(main_dir, self._pool)
-            catalog.load()
+                if created:
+                    shutil.rmtree(main_dir, ignore_errors=True)
+                raise SqlError(
+                    E_STORAGE, f"cannot create main db dir: {main_dir}"
+                ) from exc
             self._catalogs[main_dir.absolute()] = catalog
 
     # ---- 内部辅助 ----

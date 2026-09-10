@@ -104,6 +104,36 @@ def test_create_table_failure_mid_register_rolls_back_rows_and_file(
     assert storage.describe("users").columns == _columns()
 
 
+def test_create_table_table_row_update_failure_rolls_back(
+    storage, data_dir, monkeypatch
+):
+    """表行 update（写 table_id）失败时也必须整表回滚且可重建。"""
+    _fail_nth(monkeypatch, "update", fail_on_call=1)
+
+    _expect_code(lambda: storage.create_table("users", _columns()), E_STORAGE)
+
+    pool = BufferPool(capacity=16)
+    table_rows, column_rows = _system_rows(data_dir, pool)
+    assert table_rows == []
+    assert column_rows == []
+    assert not (Path(data_dir) / "main" / "users.table").exists()
+    assert storage.list_tables() == []
+
+
+def test_create_table_flush_failure_rolls_back(storage, data_dir, monkeypatch):
+    """系统行写完后 flush 失败时也必须整表回滚且可重建。"""
+    _fail_nth_flush(monkeypatch, fail_on_call=1)
+
+    _expect_code(lambda: storage.create_table("users", _columns()), E_STORAGE)
+
+    pool = BufferPool(capacity=16)
+    table_rows, column_rows = _system_rows(data_dir, pool)
+    assert table_rows == []
+    assert column_rows == []
+    assert not (Path(data_dir) / "main" / "users.table").exists()
+    assert storage.list_tables() == []
+
+
 # ---- DROP 失败整表恢复 ----
 
 
@@ -167,6 +197,43 @@ def test_drop_table_success_removes_file_and_rows(storage, data_dir):
     assert not (Path(data_dir) / "main" / "users.table").exists()
     reopened = DatabaseServer(data_dir).connect("main")
     assert reopened.list_tables() == []
+
+
+def test_drop_table_table_row_delete_failure_restores_columns(
+    storage, data_dir, monkeypatch
+):
+    """列行删完后表行删除失败：按快照恢复整表，重启仍可读。"""
+    storage.create_table("users", _columns())
+    storage.insert("users", (1, "alice", True))
+    _fail_nth(monkeypatch, "delete", fail_on_call=4)  # 3 列行之后删表行失败
+
+    _expect_code(lambda: storage.drop_table("users"), E_STORAGE)
+
+    assert storage.describe("users").columns == _columns()
+    reopened = DatabaseServer(data_dir).connect("main")
+    assert list(reopened.scan("users")) == [(1, (1, "alice", True))]
+
+
+# ---- 惰性 scan 与 drop 的并发（单用户 API 边界） ----
+
+
+def test_scan_iterator_after_other_handle_drop_raises_storage(data_dir):
+    """持有 scan 迭代器时另一句柄删表：后续迭代必须 E_STORAGE。
+
+    断言的改动：泄漏 FileNotFoundError/struct 裸异常，或静默返回半份结果。
+    """
+    server = DatabaseServer(data_dir)
+    s1 = server.connect("main")
+    s2 = server.connect("main")
+    s1.create_table("t", (ColumnDef("body", SqlType.TEXT),))
+    for _ in range(4):
+        s1.insert("t", ("x" * 2000,))
+    iterator = s1.scan("t")
+    next(iterator)  # 至少已读一页
+
+    s2.drop_table("t")
+
+    _expect_code(lambda: list(iterator), E_STORAGE)
 
 
 # ---- __sys_ 保留前缀 ----
