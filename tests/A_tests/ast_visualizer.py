@@ -102,7 +102,7 @@ class AstVisualizerApp:
 
         instruction = ttk.Label(
             left_frame,
-            text="输入一条 V1.1 SQL；点击按钮或按 Ctrl/⌘ + Enter 解析。",
+            text="输入一条 V2 SQL；点击按钮或按 Ctrl/⌘ + Enter 解析。",
             wraplength=320,
             justify="left",
         )
@@ -170,16 +170,22 @@ class AstVisualizerApp:
         self._sql_input.bind("<Control-Return>", self._on_parse_shortcut)
         self._sql_input.bind("<Command-Return>", self._on_parse_shortcut)
 
-    # 此方法向文本框填入一条包含 SELECT、WHERE、AND 和比较运算符的演示 SQL。
+    # 此方法填入一条覆盖别名、限定列、JOIN、BOOLEAN 和逻辑优先级的 V2 SQL。
     def _insert_default_sql(self) -> None:
         """写入默认演示 SQL，帮助首次打开程序时立即理解预期输入。
 
-        示例故意包含两个比较条件，以便右侧展示 SelectStmt、And、Cmp、Column
-        和 Literal 的完整层级。用户可直接编辑或替换为其他支持的 SQL 语句。
+        示例覆盖 SelectStmt 新增的 TableRef 与 joins 字段，并包含限定列、布尔
+        字面量及 NOT、AND、OR 表达式，便于答辩时一次展示 V2 的主要 AST 层级。
+        用户可直接编辑或替换为其他受支持的单条 SQL 语句。
         """
         self._sql_input.insert(
             "1.0",
-            "SELECT name, age FROM users WHERE age >= 18 AND name <> 'bob';",
+            (
+                "SELECT u.id, o.user_id\n"
+                "FROM users u\n"
+                "INNER JOIN orders o ON u.id = o.user_id AND NOT o.deleted\n"
+                "WHERE u.active = TRUE OR o.total > 100;"
+            ),
         )
 
     # 此快捷键回调复用按钮对应的解析操作，并阻止 Text 插入换行。

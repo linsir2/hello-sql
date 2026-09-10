@@ -9,8 +9,10 @@ contracts.ast 中规定的 AST。
 1. 每个 Token 都保留 SQL 源码中的原始文本（``lexeme``），以便报错时
    显示用户实际输入的内容；
 2. 每个 Token 都保存起始位置（``position``），供 ParseError 精确定位；
-3. 行号与列号都从 1 开始计数。例如输入第一个字符的位置为 (1, 1)；
-4. 关键字通过专用 TokenType 表示。这样 parser 可以清楚地区分关键字与
+3. 每个 Token 都保存零基、左闭右开的源码字符偏移 ``[start_offset,
+   end_offset)``，后续可直接用 Python 切片恢复原文；
+4. 行号与列号都从 1 开始计数。例如输入第一个字符的位置为 (1, 1)；
+5. 关键字通过专用 TokenType 表示。这样 parser 可以清楚地区分关键字与
    普通标识符，也能拒绝把保留字作为库名、表名或列名。
 """
 
@@ -60,21 +62,37 @@ class TokenType(Enum):
     KW_UPDATE = auto()
     KW_SET = auto()
     KW_DELETE = auto()
+    # V2 逻辑表达式关键字。AND、OR、NOT 在 parser 中将按 NOT > AND > OR
+    # 的优先级构建 AST；Token 层只负责将它们与普通标识符区分开。
     KW_AND = auto()
-    # OR 在 V1 文法中不支持，但它仍是保留字；单独定义后，parser 能给出
-    # 明确的 E_SYNTAX，而不是误把 OR 当作一个列名。
     KW_OR = auto()
+    KW_NOT = auto()
+
+    # V2 表引用与 INNER JOIN 关键字。AS 用于显式表别名；INNER 可省略，
+    # JOIN 和 ON 分别标记连接子句及其连接条件。
+    KW_AS = auto()
+    KW_INNER = auto()
+    KW_JOIN = auto()
+    KW_ON = auto()
+
+    # ---------- SQL 布尔字面量关键字 ----------
+    # TRUE 与 FALSE 在后续 parser 步骤中会转换为 Python bool。
+    KW_TRUE = auto()
+    KW_FALSE = auto()
 
     # ---------- SQL 类型关键字 ----------
     # 类型关键字只会出现在 CREATE TABLE 的列定义中。
     KW_INT = auto()
     KW_TEXT = auto()
     KW_REAL = auto()
+    KW_BOOLEAN = auto()
 
     # ---------- 分隔符 ----------
     LPAREN = auto()       # (
     RPAREN = auto()       # )
     COMMA = auto()        # ,
+    # DOT 用于分隔限定符与列名，例如 u.id；它不属于实数字面量内部的小数点。
+    DOT = auto()          # .
     # STAR 只用于 SELECT *，表示“按建表顺序选择全部列”，不是乘法运算符。
     # V1 SQL 不支持算术表达式，因此 lexer 不为它赋予其他含义。
     STAR = auto()         # *
@@ -115,15 +133,22 @@ class Token:
             lexeme 为 ``"18"``，字符串 ``'alice'`` 的 lexeme 包含引号。
         position: Token 第一个字符在 SQL 输入中的行列位置。parser 检测到
             缺少关键字、非法 token 或多余内容时，使用此位置构造 ParseError。
+        start_offset: Token 第一个字符在完整 SQL 字符串中的零基字符偏移。
+        end_offset: Token 最后一个字符之后的零基字符偏移。该字段与
+            start_offset 组成左闭右开的范围，可直接执行
+            ``source[start_offset:end_offset]`` 得到 lexeme。
 
     Token 不直接保存最终 AST 值。例如 ``INTEGER_LITERAL`` 的 ``"18"``
     将由 parser 转为 int 18；这样既保留了精确错误上下文，也使词法阶段
-    只专注于识别文本边界。
+    只专注于识别文本边界。偏移量按 Python 字符而非 UTF-8 字节计数；EOF
+    的两个偏移量均等于完整 SQL 字符串长度。
     """
 
     type: TokenType
     lexeme: str
     position: SourcePosition
+    start_offset: int
+    end_offset: int
 
 
 # 本映射是 lexer 识别保留字的唯一数据来源。键统一为大写，因为 SQL
@@ -146,7 +171,15 @@ KEYWORDS: dict[str, TokenType] = {
     "DELETE": TokenType.KW_DELETE,
     "AND": TokenType.KW_AND,
     "OR": TokenType.KW_OR,
+    "NOT": TokenType.KW_NOT,
+    "AS": TokenType.KW_AS,
+    "INNER": TokenType.KW_INNER,
+    "JOIN": TokenType.KW_JOIN,
+    "ON": TokenType.KW_ON,
+    "TRUE": TokenType.KW_TRUE,
+    "FALSE": TokenType.KW_FALSE,
     "INT": TokenType.KW_INT,
     "TEXT": TokenType.KW_TEXT,
     "REAL": TokenType.KW_REAL,
+    "BOOLEAN": TokenType.KW_BOOLEAN,
 }
