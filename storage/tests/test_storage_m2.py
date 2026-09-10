@@ -108,15 +108,15 @@ def test_create_table_empty_or_duplicate_columns_raises_dup(storage, columns):
     assert storage.list_tables() == []
 
 
-def test_create_after_dup_failure_overwrites_orphan_file(storage, data_dir):
-    """DUP 失败可能留下孤儿表文件（§9.4 容忍），再次合法建表应覆盖成功。
+def test_create_after_dup_failure_leaves_no_orphan_file(storage, data_dir):
+    """DUP 失败必须整表回滚（V2/D25）；再次合法建表应干净成功。
 
-    断言的改动：孤儿文件挡住后续 create_table（E_STORAGE 或 EXISTS）。
+    断言的改动：失败后留下孤儿 .table（下次启动会触发目录不一致 E_STORAGE）。
     """
     _expect_code(
         lambda: storage.create_table("users", ()), E_DUP_COLUMN
     )
-    assert _table_path(data_dir, "users").is_file()  # 孤儿文件被容忍
+    assert not _table_path(data_dir, "users").exists()
 
     storage.create_table("users", _columns())
 

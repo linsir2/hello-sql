@@ -48,7 +48,7 @@ _PAGE0_STRUCT = struct.Struct("<4sHHQI")
 def create_table_file(file_path: Path) -> None:
     """建表文件并写页 0（magic/version/next_row_id=1/free_head=0），flush。
 
-    列定义不写进本文件（catalog 是权威，D12）。
+    列定义不写进本文件（页式系统表 catalog 是权威，D20）。
     文件已存在（孤儿文件）时直接覆盖重建：catalog 是权威，孤儿数据属垃圾。
     """
     page = bytearray(PAGE_SIZE)

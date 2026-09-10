@@ -10,6 +10,12 @@ PAGE_SIZE = 4096
 TABLE_FILE_SUFFIX = ".table"
 CATALOG_FILE_NAME = "catalog.json"
 
+# V2 页式系统表（D20/D21；M1 只实现自举，M2 起作为权威目录）
+SYS_TABLES_FILE_NAME = "sys_tables.db"
+SYS_COLUMNS_FILE_NAME = "sys_columns.db"
+RESERVED_TABLE_PREFIX = "__sys_"
+LEGACY_MIGRATED_FILE_NAME = "catalog.v1.migrated.json"
+
 # ---- 表文件头（页 0）标识（D04）----
 TABLE_FILE_MAGIC = b"HSQL"  # 4 B
 TABLE_FILE_VERSION = 1      # 写入 2 B
@@ -44,6 +50,9 @@ RECORD_HEADER_SIZE = 8  # 记录头：u64 row_id
 TEXT_LEN_SIZE = 4
 INT_SIZE = 8
 REAL_SIZE = 8
+BOOL_SIZE = 1
+BOOL_FALSE_BYTE = 0x00
+BOOL_TRUE_BYTE = 0x01
 
 # 单条记录能放进一个数据页的最大编码长度（≈ 4080 B）
 INLINE_RECORD_LIMIT = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_SIZE
@@ -78,7 +87,7 @@ MAX_ROW_BYTES = 16 * 1024 * 1024
 # ---- 缓存（D16）----
 DEFAULT_CACHE_CAPACITY = 64
 
-# ---- catalog.json（D12）----
+# ---- V1 catalog.json（D12；V2 起只作为一次性迁移输入，不再创建）----
 CATALOG_VERSION = 1
 JSON_VERSION_KEY = "version"
 JSON_TABLES_KEY = "tables"
