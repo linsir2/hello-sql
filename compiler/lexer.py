@@ -8,7 +8,8 @@
 2. 这个 Token 在原 SQL 文本中的位置；
 3. 文本中是否存在无法组成任何 Token 的非法内容。
 
-本实现遵守 docs/contract-v1.md 的 V1.1 词法规则：关键字大小写不敏感，
+本实现保留 docs/contract-v1.md 的 V1.1 词法规则，并按 V2 契约扩展 BOOLEAN、
+逻辑表达式、表别名、INNER JOIN 与限定列所需的 Token。关键字大小写不敏感，
 标识符仅支持 ASCII 字母、数字和下划线，字符串使用单引号及 ``''`` 转义。
 词法器输出的 Token 会在 parser.py 中被消费，最终构建 contracts.ast 的 AST。
 """
@@ -25,6 +26,7 @@ _SINGLE_CHAR_TOKENS: dict[str, TokenType] = {
     "(": TokenType.LPAREN,
     ")": TokenType.RPAREN,
     ",": TokenType.COMMA,
+    ".": TokenType.DOT,
     "*": TokenType.STAR,
     ";": TokenType.SEMICOLON,
     "=": TokenType.EQ,
@@ -38,7 +40,8 @@ class Lexer:
 
     Lexer 保存当前扫描下标、行号和列号。每次调用 ``_advance`` 后，位置
     都会同步移动；因此所有生成的 Token 都能记录其第一个字符的准确位置。
-    行与列遵循用户可见的 1-based 约定：第一个字符位于第 1 行第 1 列。
+    行与列遵循用户可见的 1-based 约定：第一个字符位于第 1 行第 1 列；
+    Token 的字符偏移采用零基、左闭右开的范围，便于后续生成 SourceSpan。
 
     Args:
         sql: 本次需要扫描的一条原始 SQL 字符串。语句是否完整、是否只有一条，
@@ -108,6 +111,8 @@ class Lexer:
                 type=TokenType.EOF,
                 lexeme="",
                 position=SourcePosition(self._line, self._column),
+                start_offset=self._index,
+                end_offset=self._index,
             )
         )
         return tokens
@@ -200,7 +205,13 @@ class Lexer:
 
         lexeme = self._sql[start_index : self._index]
         token_type = KEYWORDS.get(lexeme.upper(), TokenType.IDENTIFIER)
-        return Token(token_type, lexeme, start_position)
+        return Token(
+            token_type,
+            lexeme,
+            start_position,
+            start_index,
+            self._index,
+        )
 
     # 此辅助方法扫描一个整数或小数字面量，并保留其原始文本。
     def _scan_number(self) -> Token:
@@ -229,7 +240,13 @@ class Lexer:
                 self._advance()
 
         lexeme = self._sql[start_index : self._index]
-        return Token(token_type, lexeme, start_position)
+        return Token(
+            token_type,
+            lexeme,
+            start_position,
+            start_index,
+            self._index,
+        )
 
     # 此辅助方法扫描一个单引号字符串，并验证字符串转义和换行约束。
     def _scan_string(self) -> Token:
@@ -271,7 +288,13 @@ class Lexer:
             break
 
         lexeme = self._sql[start_index : self._index]
-        return Token(TokenType.STRING_LITERAL, lexeme, start_position)
+        return Token(
+            TokenType.STRING_LITERAL,
+            lexeme,
+            start_position,
+            start_index,
+            self._index,
+        )
 
     # 此辅助方法扫描 <、> 开头的比较运算符，并优先识别双字符形式。
     def _scan_comparison_operator(self) -> Token:
@@ -280,22 +303,23 @@ class Lexer:
         双字符运算符必须先处理，否则 ``>=`` 会被错误拆为 ``>`` 和 ``=``。
         由于调用方已确认当前字符是 < 或 >，本函数只处理契约允许的比较符号。
         """
+        start_index = self._index
         start_position = SourcePosition(self._line, self._column)
         first = self._advance()
         second = self._current_char()
 
         if first == "<" and second == ">":
             self._advance()
-            return Token(TokenType.NE, "<>", start_position)
+            return Token(TokenType.NE, "<>", start_position, start_index, self._index)
         if first == "<" and second == "=":
             self._advance()
-            return Token(TokenType.LE, "<=", start_position)
+            return Token(TokenType.LE, "<=", start_position, start_index, self._index)
         if first == ">" and second == "=":
             self._advance()
-            return Token(TokenType.GE, ">=", start_position)
+            return Token(TokenType.GE, ">=", start_position, start_index, self._index)
         if first == "<":
-            return Token(TokenType.LT, "<", start_position)
-        return Token(TokenType.GT, ">", start_position)
+            return Token(TokenType.LT, "<", start_position, start_index, self._index)
+        return Token(TokenType.GT, ">", start_position, start_index, self._index)
 
     # 此辅助方法扫描一个确定只有一个字符的分隔符或等号。
     def _scan_single_char_token(self) -> Token:
@@ -304,9 +328,16 @@ class Lexer:
         调用本函数前，tokenize 已保证当前字符存在于映射中；该前提使此函数
         只承担“消费一个字符并生成 Token”的职责，而不混入错误分支。
         """
+        start_index = self._index
         start_position = SourcePosition(self._line, self._column)
         character = self._advance()
-        return Token(_SINGLE_CHAR_TOKENS[character], character, start_position)
+        return Token(
+            _SINGLE_CHAR_TOKENS[character],
+            character,
+            start_position,
+            start_index,
+            self._index,
+        )
 
     # 此静态辅助方法判断字符能否作为 ASCII 标识符的第一个字符。
     @staticmethod
