@@ -37,6 +37,9 @@ from contracts.storage import Row, RowId
 
 from storage.cache import BufferPool
 from storage.constants import (
+    BOOL_FALSE_BYTE,
+    BOOL_SIZE,
+    BOOL_TRUE_BYTE,
     INLINE_RECORD_LIMIT,
     MAX_ROW_BYTES,
     OVERFLOW_ANCHOR_FIRST_PAGE_OFFSET,
@@ -97,6 +100,10 @@ def encode_record(
             parts.append(_INT.pack(value))
         elif column.type is SqlType.REAL:
             parts.append(_REAL.pack(value))
+        elif column.type is SqlType.BOOLEAN:
+            parts.append(
+                bytes((BOOL_TRUE_BYTE if value else BOOL_FALSE_BYTE,))
+            )
         else:  # SqlType.TEXT
             raw = value.encode("utf-8")
             parts.append(_TEXT_LEN.pack(len(raw)))
@@ -123,6 +130,15 @@ def decode_record(record: bytes, columns: Sequence[ColumnDef]) -> Row:
             elif column.type is SqlType.REAL:
                 (value,) = _REAL.unpack_from(record, pos)
                 pos += _REAL.size
+            elif column.type is SqlType.BOOLEAN:
+                raw = record[pos : pos + BOOL_SIZE]
+                if len(raw) < BOOL_SIZE:
+                    raise SqlError(E_STORAGE, "corrupt record: truncated boolean")
+                raw_byte = raw[0]
+                pos += BOOL_SIZE
+                if raw_byte not in (BOOL_FALSE_BYTE, BOOL_TRUE_BYTE):
+                    raise SqlError(E_STORAGE, "corrupt boolean value")
+                value = raw_byte == BOOL_TRUE_BYTE
             else:  # SqlType.TEXT
                 (length,) = _TEXT_LEN.unpack_from(record, pos)
                 pos += _TEXT_LEN.size

@@ -122,6 +122,7 @@ class TableRef:
     name: str
     alias: str | None = None
 
+    # 此属性返回名称绑定阶段使用的有效限定符，存在别名时优先使用别名。
     @property
     def qualifier(self) -> str:
         """返回名称绑定时使用的限定符：别名优先，否则使用表名。"""
@@ -222,7 +223,11 @@ Statement: TypeAlias = (
 
 @dataclass(frozen=True)
 class SourceSpan:
-    """一条语句在完整 SQL 输入中的一基闭区间位置。"""
+    """一条语句在完整 SQL 输入中的一基闭区间位置。
+
+    parse_script 忽略语句两侧的分隔空白；源码中存在结束分号时，闭区间包含
+    分号，否则结束位置指向语句最后一个 Token 的最后一个字符。
+    """
 
     start_line: int
     start_col: int
@@ -232,7 +237,11 @@ class SourceSpan:
 
 @dataclass(frozen=True)
 class ParsedStatement:
-    """parse_script 的单条输出，保留 AST、原文和全局源码范围。"""
+    """parse_script 的单条输出，保留 AST、原文和全局源码范围。
+
+    sql 与 span 表示同一段连续源码：不包含语句前后的分隔空白，但保留语句
+    内部的原始大小写和空白；原输入带结束分号时也保留该分号。
+    """
 
     statement: Statement
     sql: str

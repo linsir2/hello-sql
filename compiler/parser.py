@@ -1,9 +1,10 @@
 """模块 A 的语法分析器基础设施。
 
-本文件目前已实现全部 V1.1 语句的语法层工作：Token 游标读取、Token 类型
-检查、标识符标准化、字面量转换、数据库/表 DDL、INSERT、SELECT、WHERE、
-UPDATE 与 DELETE。Parser 的职责到构建 AST 为止，所有语义检查和执行均由
-runner 与 storage 模块完成。
+本文件已实现全部 V1.1 语句的语法层工作，并按 V2 计划逐步扩展。本阶段在
+原有 Token 游标、标识符标准化、DDL、INSERT、SELECT、WHERE、UPDATE 和
+DELETE 基础上，增加 BOOLEAN、Column/TableRef、表别名、INNER JOIN、通用
+标量、逻辑表达式优先级以及带原文范围的多语句解析。Parser 的职责到构建
+AST 为止，所有语义检查和执行均由 runner 与 storage 模块完成。
 
 Parser 的输入是 lexer.tokenize() 生成、且以 EOF 结尾的 Token 序列。它的
 输出最终会是 contracts.ast 中定义的 Statement。所有语法层的失败统一通过
@@ -28,10 +29,19 @@ from contracts.ast import (
     DeleteStmt,
     Expr,
     InsertStmt,
+    JoinClause,
+    JoinType,
     Literal,
+    Not,
+    Or,
+    ParsedStatement,
+    Script,
     SelectStmt,
+    ScalarExpr,
+    SourceSpan,
     SqlType,
     Statement,
+    TableRef,
     UseDatabaseStmt,
     UpdateStmt,
     Value,
@@ -45,7 +55,19 @@ _SQL_TYPE_TOKENS: dict[TokenType, SqlType] = {
     TokenType.KW_INT: SqlType.INT,
     TokenType.KW_TEXT: SqlType.TEXT,
     TokenType.KW_REAL: SqlType.REAL,
+    TokenType.KW_BOOLEAN: SqlType.BOOLEAN,
 }
+
+
+# 此元组集中列出 SQL 字面量 Token，供 parse_value 与通用标量解析共同使用。
+# 保持单一数据来源可以避免新增值类型时两个解析入口支持范围不一致。
+_VALUE_TOKEN_TYPES: tuple[TokenType, ...] = (
+    TokenType.INTEGER_LITERAL,
+    TokenType.REAL_LITERAL,
+    TokenType.STRING_LITERAL,
+    TokenType.KW_TRUE,
+    TokenType.KW_FALSE,
+)
 
 
 # 此映射定义 WHERE 中比较运算符 Token 与 AST Cmp.op 字符串的固定对应关系。
@@ -58,6 +80,13 @@ _COMPARISON_OPERATORS: dict[TokenType, str] = {
     TokenType.GT: ">",
     TokenType.GE: ">=",
 }
+
+
+# 此集合列出 V2 不支持的 JOIN 修饰词，防止隐式别名逻辑误吞 LEFT 等单词。
+# 它们后接 JOIN 时会留在 Token 流中，并最终由单语句完整性检查报告 E_SYNTAX。
+_UNSUPPORTED_JOIN_MODIFIERS = frozenset(
+    {"left", "right", "full", "cross", "natural"}
+)
 
 
 class Parser:
@@ -186,15 +215,17 @@ class Parser:
 
     # 此公共方法读取一个 SQL 字面量，并转换成 contracts.ast.Value 原生值。
     def parse_value(self) -> Value:
-        """消费整数、小数或字符串 Token，并返回对应的 Python 原生值。
+        """消费数字、字符串或布尔 Token，并返回对应的 Python 原生值。
 
         AST 中禁止把数字保留为字符串，所以 ``"18"`` 必须转换为 int 18，
         ``"18.5"`` 必须转换为 float 18.5。字符串 Token 保留原始引号和转义，
         因此通过 ``_decode_string_literal`` 去除外层单引号，并把 ``''`` 恢复为
-        单个单引号。值是否符合某张表列的 SQL 类型不由 A 判断，属于 C/B。
+        单个单引号。V2 的 ``TRUE`` 和 ``FALSE`` 分别转换为严格的 Python
+        ``True`` 与 ``False``。值是否符合某张表列的 SQL 类型不由 A 判断，
+        属于 C/B。
 
         Returns:
-            int、float 或 str，符合 contracts.ast.Value 的类型别名。
+            int、float、str 或 bool，符合 contracts.ast.Value 的类型别名。
 
         Raises:
             ParseError: 当前 Token 不是字面量时抛出。若手工构造了格式错误的
@@ -210,13 +241,14 @@ class Parser:
         if token.type is TokenType.STRING_LITERAL:
             self.advance()
             return self._decode_string_literal(token)
+        if token.type is TokenType.KW_TRUE:
+            self.advance()
+            return True
+        if token.type is TokenType.KW_FALSE:
+            self.advance()
+            return False
 
-        expected_types = (
-            TokenType.INTEGER_LITERAL,
-            TokenType.REAL_LITERAL,
-            TokenType.STRING_LITERAL,
-        )
-        expected_text = self._format_expected_types(expected_types)
+        expected_text = self._format_expected_types(_VALUE_TOKEN_TYPES)
         raise ParseError(
             token.position.line,
             token.position.column,
@@ -227,10 +259,9 @@ class Parser:
     def parse(self) -> Statement:
         """解析一条完整 SQL 语句，允许末尾至多存在一个分号。
 
-        契约规定一次 parse 只接收一条 SQL，因此本方法先调用
-        ``parse_statement`` 解析主体，再消费可选分号，最后强制要求 EOF。
-        例如 ``CREATE DATABASE shop;`` 合法，而 ``USE main;;`` 与
-        ``USE main DROP DATABASE shop`` 都会在剩余 Token 处报 E_SYNTAX。
+        V2 继续保留 V1.1 的单语句行为。本方法先解析语句主体，再通过
+        ``_expect_single_statement_end`` 检查可选分号和 EOF，因此第二条语句
+        与连续分号仍会报告 E_SYNTAX。
 
         Returns:
             当前已实现语句对应的 AST Statement。
@@ -240,10 +271,120 @@ class Parser:
                 仍存在第二个分号、第二条语句或其他多余内容时抛出。
         """
         statement = self.parse_statement()
+        self._expect_single_statement_end()
+        return statement
+
+    # 此内部方法落实 parse 的单语句结束规则，并拒绝第二条语句或多余分号。
+    def _expect_single_statement_end(self) -> None:
+        """消费至多一个结束分号，并强制要求下一个 Token 为 EOF。
+
+        该函数将单语句结束规则集中封装：parse 只能处理一条语句，而
+        parse_script 才能在分号后继续解析。多个连续分号不会被静默跳过。
+
+        Raises:
+            ParseError: 可选分号后仍存在另一条语句或其他 Token 时抛出。
+        """
         if self.peek().type is TokenType.SEMICOLON:
             self.advance()
         self.expect(TokenType.EOF, "end of input after one SQL statement")
-        return statement
+
+    # 此公共方法连续消费完整 Token 流，并为每条 SQL 构建带原文范围的结果。
+    def parse_script(self, source: str) -> Script:
+        """解析零条或多条分号分隔的 SQL，返回有序 ParsedStatement 元组。
+
+        本方法直接在 Lexer 生成的同一 Token 流上循环调用 parse_statement，
+        不对 source 使用字符串分割，因此字符串字面量中的分号仍属于原 Token。
+        语句之间必须存在分号，只有最后一条语句可以省略分号。每条语句使用
+        Token 的零基半开偏移截取原文，再转换为契约要求的一基闭区间 span。
+
+        Args:
+            source: 生成当前 Parser Token 序列的完整原始 SQL 文本。
+
+        Returns:
+            按源码顺序排列的 ParsedStatement 元组；空白输入返回空元组。
+
+        Raises:
+            ParseError: 语句本身非法、出现空语句，或相邻语句之间缺少分号时
+                抛出；错误位置始终使用完整脚本的全局行列号。
+            ValueError: source 长度与 Token 流记录的 EOF 偏移不一致时抛出，
+                表示调用方没有传入生成该 Token 流的同一份源码。
+        """
+        eof_token = self._tokens[-1]
+        if eof_token.end_offset != len(source):
+            raise ValueError("parser source does not match token stream length")
+
+        parsed_statements: list[ParsedStatement] = []
+        while self.peek().type is not TokenType.EOF:
+            start_token = self.peek()
+            statement = self.parse_statement()
+            end_token = self._tokens[self._index - 1]
+
+            if self.peek().type is TokenType.SEMICOLON:
+                end_token = self.advance()
+            elif self.peek().type is not TokenType.EOF:
+                current = self.peek()
+                raise ParseError(
+                    current.position.line,
+                    current.position.column,
+                    "expected ';' between SQL statements or end of input, "
+                    f"found {self._format_actual_token(current)}",
+                )
+
+            parsed_statements.append(
+                self._build_parsed_statement(
+                    statement=statement,
+                    source=source,
+                    start_token=start_token,
+                    end_token=end_token,
+                )
+            )
+
+        return tuple(parsed_statements)
+
+    # 此内部方法根据首尾 Token 同时生成语句原文和一基闭区间 SourceSpan。
+    @staticmethod
+    def _build_parsed_statement(
+        statement: Statement,
+        source: str,
+        start_token: Token,
+        end_token: Token,
+    ) -> ParsedStatement:
+        """将已解析 AST 与其连续源码范围组装为 ParsedStatement。
+
+        Token 保存的是完整输入中的零基半开字符偏移和一基起始行列。本方法用
+        ``source[start:end]`` 保留用户原始大小写及语句内部空白，再把末 Token
+        的起始列加上 lexeme 长度减一，得到 SourceSpan 所需的一基闭区间终点。
+        结束分号被消费时 end_token 就是分号，因此原文与 span 都自然包含它。
+
+        Args:
+            statement: parse_statement 已构造完成的 AST。
+            source: 生成当前 Token 流的完整 SQL 脚本。
+            start_token: 当前语句第一个非空白 Token。
+            end_token: 当前语句最后一个 Token，可能是结束分号。
+
+        Returns:
+            AST、原始 SQL 和全局 SourceSpan 完全对应的 ParsedStatement。
+
+        Raises:
+            ValueError: 首尾 Token 范围无效，或 end_token 没有实际源码字符时
+                抛出，表示 Parser 内部调用违反了本方法前置条件。
+        """
+        if (
+            start_token.start_offset >= end_token.end_offset
+            or not end_token.lexeme
+        ):
+            raise ValueError("parsed statement requires a non-empty token range")
+
+        return ParsedStatement(
+            statement=statement,
+            sql=source[start_token.start_offset : end_token.end_offset],
+            span=SourceSpan(
+                start_line=start_token.position.line,
+                start_col=start_token.position.column,
+                end_line=end_token.position.line,
+                end_col=end_token.position.column + len(end_token.lexeme) - 1,
+            ),
+        )
 
     # 此公共方法根据语句第一个关键字分派到相应的具体语句解析方法。
     def parse_statement(self) -> Statement:
@@ -396,9 +537,9 @@ class Parser:
         """解析 ``INSERT INTO id VALUES '(' value (',' value)* ')'``。
 
         INSERT 的 values 至少要有一个字面量；每个字面量通过 parse_value 转为
-        int、float 或 str，并按书写顺序放入不可变元组。A 不知道目标表的列数
-        或列类型，因此“值数量不匹配”和“值类型不匹配”都不能在此处判断，必须
-        把完整 InsertStmt 交给 C/B 处理。
+        int、float、str 或 bool，并按书写顺序放入不可变元组。A 不知道目标表
+        的列数或列类型，因此“值数量不匹配”和“值类型不匹配”都不能在此处
+        判断，必须把完整 InsertStmt 交给 C/B 处理。
 
         Returns:
             包含小写表名与原生 Python 值元组的 InsertStmt。
@@ -423,7 +564,7 @@ class Parser:
         逗号后也必须再出现一个 value，因此尾逗号同样被拒绝。
 
         Returns:
-            至少包含一个 int、float 或 str 的 tuple。
+            至少包含一个 int、float、str 或 bool 的 tuple。
         """
         self.expect(TokenType.LPAREN, "'(' after VALUES")
         values = [self.parse_value()]
@@ -435,39 +576,123 @@ class Parser:
         self.expect(TokenType.RPAREN, "')' after INSERT values")
         return tuple(values)
 
-    # 此内部方法解析 SELECT 的投影、FROM 和可选 WHERE 子句，并构建 SelectStmt。
+    # 此内部方法解析 SELECT 的投影、FROM、JOIN 和可选 WHERE，并构建 AST。
     def _parse_select_statement(self) -> SelectStmt:
-        """解析 ``SELECT selectList FROM id [WHERE cond]``，返回 SelectStmt。
+        """解析 ``SELECT ... FROM tableRef { joinClause } [WHERE expr]``。
 
-        SELECT 的投影列表可以是 ``*``，也可以是一个或多个列名；显式列名按
-        原书写顺序保留，并允许重复。WHERE 存在时由 ``_parse_optional_where``
-        构建 Cmp/And 表达式；不存在时 AST 的 where 字段为 None。A 仅记录
-        条件结构，不能扫描数据或判断条件是否命中任何行。
+        SELECT 的投影列表可以是 ``*``，也可以是一个或多个普通/限定列引用；
+        显式列按原书写顺序保留，并允许重复。FROM 由 TableRef 保存表名及
+        可选别名；随后按源码顺序保存零个或多个 INNER JOIN。WHERE 存在时
+        构建完整 Expr。A 仅记录结构，不判断表列是否存在或 ON 的结果类型。
 
         Returns:
-            columns 为 None（SELECT *）或列名元组的 SelectStmt。
+            包含 Column、FROM TableRef、有序 JoinClause 和可选 WHERE 的节点。
 
         Raises:
-            ParseError: 缺少选择列表、FROM、表名，或 WHERE 不符合 V1 表达式
-                文法时抛出。
+            ParseError: SELECT、FROM、JOIN、ON 或 WHERE 结构不完整时抛出。
         """
         self.expect(TokenType.KW_SELECT)
         columns = self._parse_select_list()
         self.expect(TokenType.KW_FROM, "FROM after SELECT list")
-        table_name = self.parse_identifier()
+        table = self._parse_table_reference()
+        joins = self._parse_join_clauses()
         where = self._parse_optional_where()
-        return SelectStmt(columns=columns, table=table_name, where=where)
+        return SelectStmt(
+            columns=columns,
+            table=table,
+            where=where,
+            joins=joins,
+        )
 
-    # 此内部方法解析 SELECT 的 * 或显式列名列表，并保留列名的书写顺序。
-    def _parse_select_list(self) -> tuple[str, ...] | None:
-        """解析 ``'*'`` 或 ``id (',' id)*``，返回 None 或小写列名元组。
+    # 此内部方法解析 FROM/JOIN 的表名及可选别名，并构建 V2 TableRef 节点。
+    def _parse_table_reference(self) -> TableRef:
+        """解析 ``id [AS id | id]``，返回名称均已小写的 TableRef。
 
-        AST 契约约定 SELECT * 必须用 columns=None 表示，不能把星号保存为
-        ``('*',)``。显式列列表允许重复，例如 ``SELECT id, id FROM users``；
-        A 只保留语法顺序，C 在执行时按该顺序投影结果。
+        首先读取必需的基础表名。其后若出现 AS，则强制读取一个显式别名；
+        若直接出现普通 IDENTIFIER，则将其作为隐式别名。WHERE 等保留字、
+        分号或 EOF 不会被误识别为别名。表名和别名都通过 parse_identifier
+        统一转为小写；别名是否重复、表是否存在仍由 C 负责检查。
 
         Returns:
-            SELECT * 时返回 None；显式列列表时返回至少一个小写列名的 tuple。
+            名称已规范化，并带有可选 alias 的 TableRef。
+
+        Raises:
+            ParseError: 缺少表名，或 AS 后缺少普通标识符别名时抛出。
+        """
+        table_name = self.parse_identifier()
+        alias: str | None = None
+
+        if self.peek().type is TokenType.KW_AS:
+            self.advance()
+            alias = self.parse_identifier()
+        elif self.peek().type is TokenType.IDENTIFIER:
+            possible_alias = self.peek()
+            is_unsupported_join = (
+                possible_alias.lexeme.lower() in _UNSUPPORTED_JOIN_MODIFIERS
+                and self.peek(1).type is TokenType.KW_JOIN
+            )
+            if not is_unsupported_join:
+                alias = self.parse_identifier()
+
+        return TableRef(name=table_name, alias=alias)
+
+    # 此内部方法连续解析 SELECT 中零个或多个 JOIN，并保持源码书写顺序。
+    def _parse_join_clauses(self) -> tuple[JoinClause, ...]:
+        """解析 ``{ [INNER] JOIN tableRef ON expr }``，返回有序 JOIN 元组。
+
+        当当前 Token 不是 INNER 或 JOIN 时返回空元组；否则重复调用单项 JOIN
+        解析函数。列表按 SQL 从左到右追加，C 可据此按左结合语义构建逻辑计划。
+
+        Returns:
+            按源码顺序排列的 JoinClause 元组；没有 JOIN 时返回空元组。
+
+        Raises:
+            ParseError: 任意一项 JOIN 的表引用、ON 或表达式不完整时抛出。
+        """
+        joins: list[JoinClause] = []
+        while self.peek().type in (TokenType.KW_INNER, TokenType.KW_JOIN):
+            joins.append(self._parse_join_clause())
+        return tuple(joins)
+
+    # 此内部方法解析一项可省略 INNER 的连接子句，并构建 JoinClause AST。
+    def _parse_join_clause(self) -> JoinClause:
+        """解析 ``[INNER] JOIN tableRef ON expr``，返回 INNER JoinClause。
+
+        显式 INNER 出现时必须紧跟 JOIN；省略 INNER 时直接以 JOIN 开始。右表
+        复用表引用解析，因此支持 AS 和隐式别名；ON 条件复用完整表达式入口，
+        因此支持括号、比较、NOT、AND 与 OR。V2 的连接类型固定为 INNER。
+
+        Returns:
+            包含右侧 TableRef、ON Expr 和 JoinType.INNER 的 JoinClause。
+
+        Raises:
+            ParseError: INNER 后缺少 JOIN、缺少右表、ON 或连接条件时抛出。
+        """
+        if self.peek().type is TokenType.KW_INNER:
+            self.advance()
+            self.expect(TokenType.KW_JOIN, "JOIN after INNER")
+        else:
+            self.expect(TokenType.KW_JOIN)
+
+        right_table = self._parse_table_reference()
+        self.expect(TokenType.KW_ON, "ON after JOIN table reference")
+        condition = self._parse_expression()
+        return JoinClause(
+            right=right_table,
+            on=condition,
+            kind=JoinType.INNER,
+        )
+
+    # 此内部方法解析 SELECT 的星号或显式列引用列表，并保留其书写顺序。
+    def _parse_select_list(self) -> tuple[Column, ...] | None:
+        """解析 ``'*'`` 或 ``columnRef (',' columnRef)*``，返回投影列。
+
+        AST 契约约定 SELECT * 必须用 columns=None 表示，不能把星号保存为
+        ``('*',)``。显式列列表允许普通列和 ``u.id`` 形式的限定列，也允许
+        重复。A 只保留语法顺序和限定符，C 再执行名称绑定与投影。
+
+        Returns:
+            SELECT * 时返回 None；显式列列表时返回至少一个 Column 的 tuple。
 
         Raises:
             ParseError: SELECT 后没有 * 或标识符、逗号后缺少列名，或 * 后仍有
@@ -477,68 +702,191 @@ class Parser:
             self.advance()
             return None
 
-        columns = [self.parse_identifier()]
+        columns = [self._parse_column_reference()]
         while self.peek().type is TokenType.COMMA:
             self.advance()
-            columns.append(self.parse_identifier())
+            columns.append(self._parse_column_reference())
         return tuple(columns)
+
+    # 此内部方法解析普通列或“限定符.列名”，并构建标准 Column AST 节点。
+    def _parse_column_reference(self) -> Column:
+        """解析 ``id`` 或 ``id '.' id``，返回名称均已小写的 Column。
+
+        第一个标识符后没有点号时，它就是列名，qualifier 为 None；存在点号时，
+        第一个标识符成为表名或别名限定符，点号后的第二个标识符成为列名。
+        A 不验证限定符和列是否存在，也不判断未限定列是否存在歧义。
+
+        Returns:
+            一个普通列或带 qualifier 的不可变 Column 节点。
+
+        Raises:
+            ParseError: 缺少首个标识符，或点号后缺少列名时抛出。
+        """
+        first_identifier = self.parse_identifier()
+        if self.peek().type is not TokenType.DOT:
+            return Column(name=first_identifier)
+
+        self.advance()
+        column_name = self.parse_identifier()
+        return Column(name=column_name, qualifier=first_identifier)
+
+    # 此内部方法把列引用或 SQL 字面量统一解析为 ScalarExpr 操作数。
+    def _parse_scalar(self) -> ScalarExpr:
+        """解析 ``columnRef`` 或 ``value``，返回 Column 或 Literal。
+
+        IDENTIFIER 开头的输入交给列引用解析；数字、字符串和布尔 Token 交给
+        parse_value 转换后包装为 Literal。该方法只区分语法形状，不做列绑定、
+        类型推导或布尔上下文检查，这些均由 C 在获得 AST 后完成。
+
+        Returns:
+            Column 或 Literal 类型的通用标量操作数。
+
+        Raises:
+            ParseError: 当前 Token 既不是列引用开头，也不是受支持字面量时抛出。
+        """
+        token = self.peek()
+        if token.type is TokenType.IDENTIFIER:
+            return self._parse_column_reference()
+        if token.type in _VALUE_TOKEN_TYPES:
+            return Literal(value=self.parse_value())
+
+        raise ParseError(
+            token.position.line,
+            token.position.column,
+            "expected a column reference or literal, "
+            f"found {self._format_actual_token(token)}",
+        )
 
     # 此内部方法识别可选 WHERE，并在存在时把条件子句交给完整表达式解析。
     def _parse_optional_where(self) -> Expr | None:
         """解析可选的 ``WHERE cond``；没有 WHERE 时返回 None。
 
         SELECT、UPDATE、DELETE 共用同一套 WHERE 文法，因此将可选入口集中在
-        一个方法中，保证三类语句产生完全相同的 Cmp/And AST 形状。A 不执行
-        条件判断，只将列名、比较符和字面量保存给 C 的运行层。
+        一个方法中，保证三类语句产生相同的表达式 AST。A 不执行条件判断，
+        只记录 Column、Literal、Cmp、Not、And 和 Or 的嵌套关系并交给 C。
 
         Returns:
-            不存在 WHERE 时返回 None；存在时返回 Cmp 或由 And 连接的 Expr。
+            不存在 WHERE 时返回 None；存在时返回完整 Expr 表达式树。
         """
         if self.peek().type is not TokenType.KW_WHERE:
             return None
         self.advance()
-        return self._parse_where_expression()
+        return self._parse_expression()
 
-    # 此内部方法解析至少一个比较条件，并将多个 AND 条件组织为左结合 And 树。
-    def _parse_where_expression(self) -> Expr:
-        """解析 ``cmp { AND cmp }``，返回 Cmp 或左结合的 And 表达式树。
+    # 此内部方法作为表达式统一入口，从最低优先级的 OR 层开始递归下降。
+    def _parse_expression(self) -> Expr:
+        """解析一个完整 V2 表达式，并返回其优先级结构对应的 AST。
 
-        例如 ``a = 1 AND b >= 2 AND c <> 'x'`` 被构造为
-        ``And(And(cmp_a, cmp_b), cmp_c)``。左结合形状稳定、易于 C 逐层求值，
-        同时满足 V1 只支持 AND、没有 OR 和括号的契约限制。
+        入口选择 OR 层，是因为递归下降解析器应从最低优先级开始：OR 的每个
+        操作数先交给更高优先级的 AND、NOT、predicate 和比较层完成。这样 AST
+        的嵌套结构天然表达 ``括号 > 比较 > NOT > AND > OR``，无需后期重排。
 
         Returns:
-            单个条件时返回 Cmp；两个及以上条件时返回 And。
+            Column、Literal、Cmp、Not、And 或 Or 组成的完整 Expr。
 
         Raises:
-            ParseError: WHERE 后缺少比较条件，或 AND 后缺少下一个比较条件时抛出。
+            ParseError: 当前 Token 不能作为表达式开头，或子表达式不完整时抛出。
         """
-        expression: Expr = self._parse_comparison()
+        return self._parse_or_expression()
 
-        while self.peek().type is TokenType.KW_AND:
+    # 此内部方法解析最低优先级 OR，并把连续 OR 构造成左结合表达式树。
+    def _parse_or_expression(self) -> Expr:
+        """解析 ``andExpr { OR andExpr }``，返回左结合的 Or AST。
+
+        每个 OR 操作数先由 _parse_and_expression 完整解析，因此 AND 自动比 OR
+        结合得更紧。例如 ``a OR b AND c`` 会生成 ``Or(a, And(b, c))``。
+
+        Returns:
+            没有 OR 时返回单个高优先级表达式；否则返回左结合 Or 树。
+
+        Raises:
+            ParseError: OR 后缺少合法的 AND 层表达式时抛出。
+        """
+        expression = self._parse_and_expression()
+
+        while self.peek().type is TokenType.KW_OR:
             self.advance()
-            expression = And(left=expression, right=self._parse_comparison())
+            expression = Or(
+                left=expression,
+                right=self._parse_and_expression(),
+            )
 
         return expression
 
-    # 此内部方法解析“列 比较运算符 字面量”这一条 V1 最小比较表达式。
-    def _parse_comparison(self) -> Cmp:
-        """解析 ``id op value``，并构建 ``Cmp(Column, op, Literal)``。
+    # 此内部方法解析 AND 优先级层，并把连续 AND 构造成左结合表达式树。
+    def _parse_and_expression(self) -> Expr:
+        """解析 ``notExpr { AND notExpr }``，返回左结合的 And AST。
 
-        左操作数只能是列名，因此使用 parse_identifier；右操作数只能是字面量，
-        因此使用 parse_value。列与列比较、函数、算术表达式、OR、括号都没有
-        对应的解析分支，会在其出现位置抛出 E_SYNTAX。
+        每个 AND 操作数先解析 NOT 层，因此 NOT 比 AND 优先；本方法的结果又
+        作为 OR 的操作数，因此 AND 同时比 OR 优先。连续 AND 按源码顺序左结合。
 
         Returns:
-            左侧为 Column、右侧为 Literal 的 Cmp AST 节点。
+            没有 AND 时返回单个 NOT 层表达式；否则返回左结合 And 树。
 
         Raises:
-            ParseError: 缺少列名、使用了不支持的比较符，或右侧不是字面量时抛出。
+            ParseError: AND 后缺少合法的 NOT 层表达式时抛出。
         """
-        column = Column(name=self.parse_identifier())
+        expression = self._parse_not_expression()
+
+        while self.peek().type is TokenType.KW_AND:
+            self.advance()
+            expression = And(
+                left=expression,
+                right=self._parse_not_expression(),
+            )
+
+        return expression
+
+    # 此内部方法递归解析一元 NOT，使其优先于 AND/OR 并允许连续取反。
+    def _parse_not_expression(self) -> Expr:
+        """解析 ``NOT notExpr`` 或 predicate，返回 Not 或更高优先级表达式。
+
+        遇到 NOT 时递归调用自身，因此 ``NOT NOT active`` 会生成嵌套 Not；
+        没有 NOT 时进入 predicate 层。predicate 会先完成比较，所以
+        ``NOT age = 18`` 的结果是 ``Not(Cmp(...))`` 而不是比较一个 Not 节点。
+
+        Returns:
+            Not 节点，或未带 NOT 的 predicate 表达式。
+
+        Raises:
+            ParseError: NOT 后缺少另一个 NOT 或合法 predicate 时抛出。
+        """
+        if self.peek().type is TokenType.KW_NOT:
+            self.advance()
+            return Not(operand=self._parse_not_expression())
+        return self._parse_predicate()
+
+    # 此内部方法解析括号表达式，或解析标量及其可选比较后半段。
+    def _parse_predicate(self) -> Expr:
+        """解析 ``'(' expr ')'`` 或 ``scalar [comparisonOp scalar]``。
+
+        括号内递归调用完整表达式入口，因此括号能够覆盖 AND、OR 等默认
+        优先级；括号本身不生成 AST 节点。非括号分支允许比较两侧均为任意
+        ScalarExpr，也允许裸列或裸字面量直接作为 Expr 交给 C 做类型检查。
+
+        比较两侧都通过 _parse_scalar 读取，因此支持列与列、列与字面量、
+        字面量与列以及字面量与字面量。比较运算符是可选的，所以裸列和裸
+        字面量也能作为 Expr；它们是否适用于 WHERE 由 C 做类型检查。
+
+        Returns:
+            去除语法括号后的内部 Expr、一个 ScalarExpr，或一个 Cmp 节点。
+
+        Raises:
+            ParseError: 括号不闭合、缺少左侧标量，或比较后缺少右侧标量时抛出。
+        """
+        if self.peek().type is TokenType.LPAREN:
+            self.advance()
+            expression = self._parse_expression()
+            self.expect(TokenType.RPAREN, "')' after parenthesized expression")
+            return expression
+
+        left = self._parse_scalar()
+        if self.peek().type not in _COMPARISON_OPERATORS:
+            return left
+
         operator = self._parse_comparison_operator()
-        value = Literal(value=self.parse_value())
-        return Cmp(left=column, op=operator, right=value)
+        right = self._parse_scalar()
+        return Cmp(left=left, op=operator, right=right)
 
     # 此内部方法将当前比较运算符 Token 转换为 AST Cmp.op 所需的字符串。
     def _parse_comparison_operator(self) -> str:
@@ -677,19 +1025,19 @@ class Parser:
         column_type = self._parse_sql_type()
         return ColumnDef(name=column_name, type=column_type)
 
-    # 此内部方法把 INT、TEXT、REAL 类型关键字映射为 contracts.ast.SqlType。
+    # 此内部方法把四种 SQL 类型关键字映射为 contracts.ast.SqlType。
     def _parse_sql_type(self) -> SqlType:
         """消费一个 SQL 类型关键字，并返回对应的 SqlType 枚举成员。
 
-        V1.1 只支持 INT、TEXT、REAL。遇到其他关键字、标识符或 EOF 时，方法
-        使用当前 Token 的位置抛出 ParseError；这样 CREATE TABLE 的列类型错误
-        能准确定位到错误位置。
+        V1.1 的 INT、TEXT、REAL 与 V2 的 BOOLEAN 都在固定映射中。遇到其他
+        关键字、标识符或 EOF 时，方法使用当前 Token 的位置抛出 ParseError；
+        这样 CREATE TABLE 的列类型错误能准确定位到错误位置。
 
         Returns:
-            SqlType.INT、SqlType.TEXT 或 SqlType.REAL。
+            SqlType.INT、SqlType.TEXT、SqlType.REAL 或 SqlType.BOOLEAN。
 
         Raises:
-            ParseError: 当前 Token 不是三种受支持类型关键字之一时抛出。
+            ParseError: 当前 Token 不是四种受支持类型关键字之一时抛出。
         """
         token = self.peek()
         sql_type = _SQL_TYPE_TOKENS.get(token.type)
@@ -697,7 +1045,8 @@ class Parser:
             raise ParseError(
                 token.position.line,
                 token.position.column,
-                f"expected INT, TEXT, or REAL, found {self._format_actual_token(token)}",
+                "expected INT, TEXT, REAL, or BOOLEAN, "
+                f"found {self._format_actual_token(token)}",
             )
         self.advance()
         return sql_type

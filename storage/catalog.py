@@ -1,26 +1,20 @@
-"""系统目录 catalog（PRD §9；D12）。
+"""系统目录 Catalog（V2 D20/D22/D25）。
 
-定位：B 的**私有内部记忆**，不是给别人调用的接口——describe / list_tables /
-create_table / drop_table / insert 全靠它；C 只通过公开方法间接使用，A 不碰。
+定位：B 的私有内部记忆。M2 起权威持久化是两张页式系统表
+``__sys_tables`` / ``__sys_columns``（物理文件 sys_tables.db / sys_columns.db）；
+V1 catalog.json 只作为迁移输入（见 catalog_migration.py）。
 
 不变量：
-- 每库恰好一份 catalog.json（本库目录下，文件名见 constants，D03）；
-- 内存形态：tables: dict[表名, tuple[ColumnDef, ...]]，插入顺序 = 建表顺序；
-- 持久化 JSON：{"version": 1, "tables": {表名: {"columns": [{"name", "type"}]}}}；
-- 版本不符 / JSON 损坏 / 结构非法 / 文件缺失 → E_STORAGE；
-- 一致性顺序（§9.4）：create_table 先建文件后注册；drop_table 先摘牌后删文件；
-  catalog 是权威，孤儿表文件本期容忍（不自动清理）；
-- 本文件不做 SQL 语义检查（D13），只做注册表增删查与持久化；
-- 表名格式校验（E_BAD_ARG）是门面职责，本层不重复；持久化数据里的
-  非法名字/列结构一律视为文件损坏（E_STORAGE）。
-
-实现阶段：M0（本文件已实现；错误归属见模块头注释与测试）。
+- 内存形态：tables: dict[表名, tuple[ColumnDef, ...]]，列序 = ordinal 0..N-1；
+- 系统表 Schema 由 syscatalog 内置常量定义，不查询 Catalog 自身；
+- table_id == __sys_tables 行 row_id（D22）；
+- file_name == <表名>.table；系统表不出现在本注册表中；
+- 任何结构非法 / 记录与文件不一致 → E_STORAGE；
+- 本层不做 SQL 语义检查（D13），只做注册表增删查与系统表持久化。
 """
 
 from __future__ import annotations
 
-import json
-import os
 import re
 from pathlib import Path
 from typing import Sequence
@@ -33,139 +27,136 @@ from contracts.errors import (
     E_TABLE_NOT_FOUND,
     SqlError,
 )
-from storage.constants import (
-    CATALOG_VERSION,
-    JSON_COLUMNS_KEY,
-    JSON_NAME_KEY,
-    JSON_TABLES_KEY,
-    JSON_TYPE_KEY,
-    JSON_VERSION_KEY,
-)
+from storage.cache import BufferPool
+from storage.constants import RESERVED_TABLE_PREFIX, TABLE_FILE_SUFFIX
+from storage.syscatalog import open_system_tables, system_table_paths
 
 
 _IDENTIFIER_RE = re.compile(r"[a-z_][a-z0-9_]*\Z")
 
 
 class Catalog:
-    """本库 schema 的内存注册表 + 持久化。
+    """本库 schema 的内存注册表 + 两张页式系统表持久化（M2）。"""
 
-    path   ：catalog.json 的绝对路径；
-    tables ：表名 → 按建表顺序的列定义（表内永久顺序，不可变）。
-    """
-
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
+    def __init__(self, db_dir: str | Path, pool: BufferPool) -> None:
+        self.db_dir = Path(db_dir)
+        self._pool = pool
+        self._systems = open_system_tables(self.db_dir, pool)
         self.tables: dict[str, tuple[ColumnDef, ...]] = {}
+        self._table_row_ids: dict[str, int] = {}
 
-    # ---- 持久化 ----
+    # ---- 加载与校验 ----
 
     def load(self) -> None:
-        """从磁盘读入并校验；任何损坏形态都抛 E_STORAGE，绝不静默当空库。"""
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-            doc = json.loads(raw)
-        except FileNotFoundError as exc:
-            raise SqlError(E_STORAGE, f"catalog file missing: {self.path}") from exc
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise SqlError(E_STORAGE, f"cannot read catalog {self.path}") from exc
+        """扫描两张系统表并校验，重建内存注册表；任何损坏都抛 E_STORAGE。"""
+        by_name: dict[str, int] = {}
+        by_id: dict[int, tuple[str, str]] = {}
+        for row_id, values in self._systems.tables.scan():
+            table_id, table_name, file_name = values
+            if type(table_id) is not int:
+                raise SqlError(E_STORAGE, "corrupt system catalog: table_id not int")
+            if table_id != row_id:
+                raise SqlError(
+                    E_STORAGE,
+                    "corrupt system catalog: table_id does not match row_id",
+                )
+            self._check_stored_name(table_name)
+            if table_name.startswith(RESERVED_TABLE_PREFIX):
+                raise SqlError(
+                    E_STORAGE,
+                    f"corrupt system catalog: reserved table {table_name!r}",
+                )
+            expected_file = f"{table_name}{TABLE_FILE_SUFFIX}"
+            if file_name != expected_file:
+                raise SqlError(
+                    E_STORAGE,
+                    f"corrupt system catalog: bad file_name {file_name!r}",
+                )
+            if table_name in by_name or table_id in by_id:
+                raise SqlError(
+                    E_STORAGE,
+                    f"corrupt system catalog: duplicate table {table_name!r}",
+                )
+            by_name[table_name] = table_id
+            by_id[table_id] = (table_name, file_name)
 
-        if not isinstance(doc, dict):
-            raise SqlError(E_STORAGE, f"corrupt catalog {self.path}: not an object")
-        if doc.get(JSON_VERSION_KEY) != CATALOG_VERSION:
-            raise SqlError(
-                E_STORAGE, f"corrupt catalog {self.path}: unsupported version"
+        columns_by_id: dict[int, list[tuple[int, str, SqlType]]] = {}
+        for _row_id, values in self._systems.columns.scan():
+            table_id, ordinal, column_name, type_name = values
+            if table_id not in by_id:
+                raise SqlError(
+                    E_STORAGE,
+                    "corrupt system catalog: column row has unknown table_id",
+                )
+            if type(ordinal) is not int or ordinal < 0:
+                raise SqlError(
+                    E_STORAGE,
+                    "corrupt system catalog: invalid ordinal",
+                )
+            self._check_stored_name(column_name)
+            if not isinstance(type_name, str):
+                raise SqlError(
+                    E_STORAGE,
+                    "corrupt system catalog: column_type not a string",
+                )
+            try:
+                sql_type = SqlType(type_name)
+            except ValueError as exc:
+                raise SqlError(
+                    E_STORAGE,
+                    f"corrupt system catalog: unknown type {type_name!r}",
+                ) from exc
+            columns_by_id.setdefault(table_id, []).append(
+                (ordinal, column_name, sql_type)
             )
 
-        raw_tables = doc.get(JSON_TABLES_KEY)
-        if not isinstance(raw_tables, dict):
-            raise SqlError(E_STORAGE, f"corrupt catalog {self.path}: tables not an object")
-
         loaded: dict[str, tuple[ColumnDef, ...]] = {}
-        for table_name, raw_meta in raw_tables.items():
-            self._check_stored_name(table_name)
-            if not isinstance(raw_meta, dict):
+        for table_id, (table_name, _file_name) in by_id.items():
+            entries = columns_by_id.get(table_id)
+            if not entries:
                 raise SqlError(
                     E_STORAGE,
-                    f"corrupt catalog {self.path}: table {table_name!r} meta invalid",
+                    f"corrupt system catalog: table {table_name!r} has no columns",
                 )
-            raw_columns = raw_meta.get(JSON_COLUMNS_KEY)
-            if not isinstance(raw_columns, list) or not raw_columns:
+            entries.sort(key=lambda item: item[0])
+            if [ordinal for ordinal, _name, _type in entries] != list(
+                range(len(entries))
+            ):
                 raise SqlError(
                     E_STORAGE,
-                    f"corrupt catalog {self.path}: table {table_name!r} has no columns",
+                    f"corrupt system catalog: bad ordinal order for {table_name!r}",
                 )
-            columns: list[ColumnDef] = []
             seen: set[str] = set()
-            for item in raw_columns:
-                if not isinstance(item, dict):
-                    raise SqlError(
-                        E_STORAGE,
-                        f"corrupt catalog {self.path}: column entry invalid",
-                    )
-                try:
-                    column_name = item[JSON_NAME_KEY]
-                    type_name = item[JSON_TYPE_KEY]
-                except KeyError as exc:
-                    raise SqlError(
-                        E_STORAGE,
-                        f"corrupt catalog {self.path}: column field missing",
-                    ) from exc
-                if not isinstance(column_name, str):
-                    raise SqlError(
-                        E_STORAGE,
-                        f"corrupt catalog {self.path}: column name not a string",
-                    )
-                self._check_stored_name(column_name)
+            columns: list[ColumnDef] = []
+            for _ordinal, column_name, sql_type in entries:
                 if column_name in seen:
                     raise SqlError(
                         E_STORAGE,
-                        f"corrupt catalog {self.path}: duplicate column {column_name!r}",
+                        f"corrupt system catalog: duplicate column {column_name!r}",
                     )
                 seen.add(column_name)
-                try:
-                    sql_type = SqlType(type_name)
-                except ValueError as exc:
-                    raise SqlError(
-                        E_STORAGE,
-                        f"corrupt catalog {self.path}: unknown type {type_name!r}",
-                    ) from exc
                 columns.append(ColumnDef(column_name, sql_type))
             loaded[table_name] = tuple(columns)
 
-        self.tables = loaded
-
-    def save(self) -> None:
-        """内存注册表原子写回：先写临时文件再 os.replace（防半份 JSON）。"""
-        payload = {
-            JSON_VERSION_KEY: CATALOG_VERSION,
-            JSON_TABLES_KEY: {
-                name: {
-                    JSON_COLUMNS_KEY: [
-                        {JSON_NAME_KEY: c.name, JSON_TYPE_KEY: c.type.value}
-                        for c in columns
-                    ]
-                }
-                for name, columns in self.tables.items()
-            },
+        expected_files = {file_name for _name, file_name in by_id.values()}
+        actual_files = {
+            path.name
+            for path in self.db_dir.glob(f"*{TABLE_FILE_SUFFIX}")
+            if path.is_file()
         }
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        if expected_files != actual_files:
+            raise SqlError(
+                E_STORAGE,
+                "corrupt system catalog: table files do not match catalog",
             )
-            os.replace(tmp_path, self.path)
-        except OSError as exc:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise SqlError(E_STORAGE, f"cannot write catalog {self.path}") from exc
+
+        self.tables = loaded
+        self._table_row_ids = by_name
 
     # ---- 注册表增删查 ----
 
     def register(self, name: str, columns: Sequence[ColumnDef]) -> None:
-        """登记一张新表。表已存在 / 空列 / 重复列分别抛契约错误码。"""
+        """登记新表：写两张系统表并 flush；失败时回滚系统行。"""
         if name in self.tables:
             raise SqlError(E_TABLE_EXISTS, f"table already exists: {name}")
         if not columns:
@@ -178,13 +169,24 @@ class Catalog:
                     f"table {name!r} has duplicate column {column.name!r}",
                 )
             seen.add(column.name)
+
+        table_id = self._insert_table_rows(name, columns)
         self.tables[name] = tuple(columns)
+        self._table_row_ids[name] = table_id
 
     def unregister(self, name: str) -> None:
-        """注销一张表；表不存在抛 E_TABLE_NOT_FOUND。"""
+        """注销表：删两张系统表行并 flush；失败时按快照恢复。"""
         if name not in self.tables:
             raise SqlError(E_TABLE_NOT_FOUND, f"table not found: {name}")
+        columns = self.tables[name]
+        table_id = self._table_row_ids[name]
+        try:
+            self._delete_table_rows(table_id)
+        except SqlError:
+            self._restore_table(name, columns)
+            raise
         del self.tables[name]
+        del self._table_row_ids[name]
 
     def get(self, name: str) -> tuple[ColumnDef, ...]:
         """查表结构（表不存在抛 E_TABLE_NOT_FOUND）。"""
@@ -194,13 +196,95 @@ class Catalog:
             raise SqlError(E_TABLE_NOT_FOUND, f"table not found: {name}") from exc
 
     def names(self) -> list[str]:
-        """返回全部表名（稳定排序，契约不承诺顺序）。"""
+        """返回全部用户表名（稳定排序，契约不承诺顺序）。"""
         return sorted(self.tables)
 
-    # ---- 内部 ----
+    def flush(self) -> None:
+        """把两张系统表的脏页写回磁盘。"""
+        for path in system_table_paths(self.db_dir):
+            self._pool.flush(path)
+
+    # ---- 内部：系统行写入与回滚 ----
+
+    def _insert_table_rows(
+        self, name: str, columns: Sequence[ColumnDef]
+    ) -> int:
+        """插入 1 条表行 + N 条列行；失败时清理本次写入，原样抛错。"""
+        table_id: int | None = None
+        column_row_ids: list[int] = []
+        try:
+            table_id = self._systems.tables.insert(
+                (0, name, f"{name}{TABLE_FILE_SUFFIX}")
+            )
+            self._systems.tables.update(
+                table_id, (table_id, name, f"{name}{TABLE_FILE_SUFFIX}")
+            )
+            for ordinal, column in enumerate(columns):
+                column_row_ids.append(
+                    self._systems.columns.insert(
+                        (table_id, ordinal, column.name, column.type.value)
+                    )
+                )
+            self.flush()
+            return table_id
+        except SqlError:
+            self._best_effort_delete_rows(table_id, column_row_ids)
+            raise
+
+    def _delete_table_rows(self, table_id: int) -> None:
+        """删掉一个表的全部列行与表行，然后 flush。"""
+        for row_id, values in list(self._systems.columns.scan()):
+            if values[0] == table_id:
+                self._systems.columns.delete(row_id)
+        self._systems.tables.delete(table_id)
+        self.flush()
+
+    def _restore_table(
+        self, name: str, columns: tuple[ColumnDef, ...]
+    ) -> None:
+        """尽量把注销失败的表恢复回系统表；内存保持原注册状态。"""
+        try:
+            self._cleanup_rows_by_name(name)
+            table_id = self._insert_table_rows(name, columns)
+        except SqlError:
+            return
+        self._table_row_ids[name] = table_id
+
+    def _cleanup_rows_by_name(self, name: str) -> None:
+        """清掉系统表里某个表名的任何残留行（用于恢复前清场）。"""
+        stale_ids: set[int] = set()
+        for row_id, values in list(self._systems.tables.scan()):
+            if values[1] == name:
+                stale_ids.add(row_id)
+                self._systems.tables.delete(row_id)
+        for row_id, values in list(self._systems.columns.scan()):
+            if values[0] in stale_ids:
+                self._systems.columns.delete(row_id)
+        self.flush()
+
+    def _best_effort_delete_rows(
+        self, table_id: int | None, column_row_ids: Sequence[int]
+    ) -> None:
+        """注册失败后的尽力回滚；回滚自身的错误不覆盖原始错误。"""
+        for row_id in reversed(list(column_row_ids)):
+            try:
+                self._systems.columns.delete(row_id)
+            except SqlError:
+                pass
+        if table_id is not None:
+            try:
+                self._systems.tables.delete(table_id)
+            except SqlError:
+                pass
+        try:
+            self.flush()
+        except SqlError:
+            pass
+
+    # ---- 内部：名字校验 ----
 
     @staticmethod
     def _check_stored_name(name: str) -> None:
         """持久化数据里的标识符必须是合法小写标识符，否则视为文件损坏。"""
         if not isinstance(name, str) or not _IDENTIFIER_RE.fullmatch(name):
-            raise SqlError(E_STORAGE, f"corrupt catalog: invalid stored name {name!r}")
+            raise SqlError(E_STORAGE, f"corrupt system catalog: invalid name {name!r}")

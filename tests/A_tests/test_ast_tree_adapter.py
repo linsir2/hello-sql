@@ -6,22 +6,75 @@
 
 from __future__ import annotations
 
-from contracts.ast import Cmp, Column, Literal, SelectStmt
-from tests.A_tests.ast_tree_adapter import ast_to_tree
+from compiler import parse
+from contracts.ast import Cmp, Column, Literal, SelectStmt, TableRef
+from tests.A_tests.ast_tree_adapter import TreeNode, ast_to_tree
+
+
+# 此辅助函数递归收集可视化树标签，便于核对 V2 深层 AST 节点是否全部出现。
+def _collect_labels(node: TreeNode) -> tuple[str, ...]:
+    """按先序遍历返回当前节点及全部后代节点的标签。
+
+    Args:
+        node: 需要检查的通用可视化树根节点。
+
+    Returns:
+        按“根节点在前、子树从左到右”排列的不可变标签元组。
+    """
+    labels = [node.label]
+    for child in node.children:
+        labels.extend(_collect_labels(child))
+    return tuple(labels)
 
 
 # 此测试确认 Statement 根节点、字段节点和嵌套 Cmp 条件都会被完整保留。
 def test_ast_to_tree_preserves_select_statement_structure() -> None:
     """将带 WHERE 的 SelectStmt 转换后，应保留类型、字段和值的树形层级。"""
     statement = SelectStmt(
-        columns=("name",),
-        table="users",
+        columns=(Column("name"),),
+        table=TableRef("users"),
         where=Cmp(left=Column("age"), op=">=", right=Literal(18)),
     )
 
     tree = ast_to_tree(statement)
     assert tree.label == "SelectStmt"
-    assert [child.label for child in tree.children] == ["columns", "table", "where"]
+    assert [child.label for child in tree.children] == [
+        "columns",
+        "table",
+        "where",
+        "joins",
+    ]
     assert tree.children[0].children[0].label == "tuple[1]"
-    assert tree.children[1].children[0].label == "'users'"
+    assert tree.children[1].children[0].label == "TableRef"
     assert tree.children[2].children[0].label == "Cmp"
+    assert tree.children[3].children[0].label == "tuple[0]"
+
+
+# 此测试通过真实 Parser 构造复杂 SELECT，验证可视化器同步支持全部 V2 新字段。
+def test_ast_to_tree_displays_v2_select_fields_and_expression_nodes() -> None:
+    """确认别名、限定列、BOOLEAN、逻辑表达式和 JOIN 均进入展示树。"""
+    statement = parse(
+        "SELECT u.id, o.user_id "
+        "FROM users u "
+        "INNER JOIN orders o ON u.id = o.user_id AND NOT o.deleted "
+        "WHERE u.active = TRUE OR o.total > 100;"
+    )
+
+    tree = ast_to_tree(statement)
+    labels = _collect_labels(tree)
+
+    assert tree.label == "SelectStmt"
+    assert [child.label for child in tree.children] == [
+        "columns",
+        "table",
+        "where",
+        "joins",
+    ]
+    assert labels.count("Column") == 7
+    assert labels.count("TableRef") == 2
+    assert labels.count("JoinClause") == 1
+    assert "JoinType.INNER" in labels
+    assert "And" in labels
+    assert "Or" in labels
+    assert "Not" in labels
+    assert "True" in labels

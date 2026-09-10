@@ -88,13 +88,13 @@ def test_database_error_codes_cover_contract(server):
 
 
 def test_database_server_init_corrupt_main_catalog_raises_storage(tmp_path):
-    """坏 main catalog 在构造时即 E_STORAGE（不静默重建）。"""
+    """坏 main 系统目录在构造时即 E_STORAGE（不静默重建）。"""
+    from storage.constants import SYS_TABLES_FILE_NAME
+
     data_dir = str(tmp_path / "data")
     DatabaseServer(data_dir)
-    catalog = (
-        tmp_path / "data" / "main" / "catalog.json"
-    )
-    catalog.write_text("{broken", encoding="utf-8")
+    catalog = tmp_path / "data" / "main" / SYS_TABLES_FILE_NAME
+    catalog.write_bytes(b"{broken")
 
     _expect_code(lambda: DatabaseServer(data_dir), E_STORAGE)
 
