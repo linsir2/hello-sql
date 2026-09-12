@@ -25,7 +25,7 @@ V2 让 hello-sql 能跑通复杂 SQL；V3 让它**自己挑最省的路走，并
 |---|---|---|---|
 | F1 | 索引 DDL 文法 | A | 支持 `CREATE INDEX` / `DROP INDEX` 的解析与 AST |
 | F2 | B+ 树单列索引 | B | 建索引、删索引、列出索引，并与表数据保持一致 |
-| F3 | 索引扫描能力 | B | 按（表，列，比较符，字面量）返回匹配行 |
+| F3 | 索引查找能力 | B | 按（表，列，键值或键区间）返回匹配行；不接收操作符 |
 | F4 | 统计信息 | B | 返回表的行数、数据页数与列级统计 |
 | F5 | 规则型逻辑优化器 | C | 在不改变结果的前提下改写逻辑计划，可整体开关 |
 | F6 | 代价选路与强制模式 | C | 依统计与索引清单选择物理路径，并支持强制指定 |
@@ -54,6 +54,7 @@ V2 让 hello-sql 能跑通复杂 SQL；V3 让它**自己挑最省的路走，并
 | DV3-08 | 空表语义 | 返回 `row_count=0`、`page_count=0`、列 `distinct_count=0`、`min/max=None` |
 | DV3-09 | `page_count` 定义 | 只计数据页，不含页 0、空闲页、溢出链页 |
 | DV3-10 | bench 负责人 | 由你负责；实现放在最后，允许先搭空壳 |
+| DV3-11 | 索引接口不带运算符 | B 只提供 `index_lookup` / `index_range`（键值 / 键区间）；比较语义与值归纳由 C 负责，避免 B 重实现一套比较规则 |
 
 ## 4. 公共契约
 
@@ -101,37 +102,43 @@ class TableStats:
     columns: tuple[ColumnStats, ...]
 ```
 
-`BaseStorage` 协议新增五个方法：
+`BaseStorage` 协议新增六个方法：
 
 ```python
 def create_index(self, name: str, table: str, column: str) -> None: ...
 def drop_index(self, name: str) -> None: ...
 def list_indexes(self, table: str | None = None) -> list[IndexInfo]: ...
 def statistics(self, table: str) -> TableStats: ...
-def index_scan(
+def index_lookup(self, table: str, column: str, key: Value) -> Iterator[Row]: ...
+def index_range(
     self,
     table: str,
     column: str,
-    op: str,
-    value: Value,
+    lower: Value | None,
+    upper: Value | None,
+    *,
+    lower_inclusive: bool = True,
+    upper_inclusive: bool = True,
 ) -> Iterator[Row]: ...
 ```
 
 契约级语义：
 
 - 索引名在**同一数据库内唯一**；与表名、列名共用标识符规则。
-- 五个新方法对表名沿用既有规则：非法标识符与 `__sys_` 前缀 → `E_BAD_ARG`；
-  `statistics` 与 `index_scan` 只针对用户表。
-- `index_scan` 返回的 `Row` 形状必须与 `scan()` 完全一致（`row_id` + 按建表列顺序的值），使 C 侧复用同一条 ExecRow 管线。
-- `op` 取值范围固定为 `= < <= > >=`，不含 `<>`；BOOLEAN 列只支持 `=`。传入不支持的操作符 → `E_BAD_ARG`。
-- `index_scan` 在（表，列）上没有对应索引时 → `E_INDEX_NOT_FOUND`。
+- 六个新方法对表名沿用既有规则：非法标识符与 `__sys_` 前缀 → `E_BAD_ARG`；
+  `statistics` / `index_lookup` / `index_range` 只针对用户表。
+- 索引查找返回的 `Row` 形状必须与 `scan()` 完全一致（`row_id` + 按建表列顺序的值），使 C 侧复用同一条 ExecRow 管线。
+- **比较语义属 C，不属 B**：B 的索引接口不接收操作符。C 负责把比较运算符翻译成键值或键区间，并负责把值归纳到列的类型（例如 INT 列收到 `1.0` 时先归一为 `1`）；B 只按列类型收值，类型不符沿用 `E_TYPE_MISMATCH`。
+- `index_range` 的 `lower` / `upper` 为 `None` 表示该侧无界，默认闭区间；端点只允许按关键字传入，避免位置参数写错。
+- **索引键序必须与 C 的比较语义一致**：等值查找能命中的键，必须是 C 认为"相等"的值；区间查找返回的键，必须落在 C 所理解的区间内。
+- `index_lookup` / `index_range` 在（表，列）上没有对应索引时 → `E_INDEX_NOT_FOUND`。
 - `list_indexes()` 不带表名时返回该库全部索引，顺序稳定。
 
 ### 4.3 `contracts/errors.py`
 
 ```text
 E_INDEX_EXISTS     建索引时索引名已存在（B 抛）
-E_INDEX_NOT_FOUND  索引不存在：删索引、index_scan 找不到对应索引、
+E_INDEX_NOT_FOUND  索引不存在：删索引、索引查找找不到对应索引、
                    physical="index" 但无可用索引（B 抛）
 ```
 
@@ -185,7 +192,8 @@ SQL: SELECT * FROM events WHERE id = 4242 AND amount > 100
        statistics(events) → TableStats                                 [B → C]
        list_indexes(events) → tuple[IndexInfo, ...]                    [B → C]
   → C: 规则优化（F5）→ 代价选路（F6）→ 谓词下推（F7）
-  → C: 若选中索引路径，调用 index_scan(events, id, "=", 4242)          [C → B]
+  → C: 若选中索引路径，把 id = 4242 翻译成键值，调用
+       index_lookup(events, id, 4242)                                   [C → B]
   → B: 返回 Row 迭代器                                                  [B → C]
   → C: 残余条件求值 → Projection → QueryResult
 ```
@@ -211,7 +219,7 @@ Runner.execute(sql, physical="auto")    → 依统计与索引清单自行选择
 |---|---|---|
 | A → C | `CreateIndexStmt` / `DropIndexStmt` / `SelectStmt` 等 AST | `contracts/ast.py` |
 | C → B | `describe` / `scan` / `insert` / `update_row` / `delete_row` | `contracts/storage.py` |
-| C → B | `create_index` / `drop_index` / `list_indexes` / `statistics` / `index_scan` | `contracts/storage.py` |
+| C → B | `create_index` / `drop_index` / `list_indexes` / `statistics` / `index_lookup` / `index_range` | `contracts/storage.py` |
 | B → C | `TableInfo` / `Row` / `RowId` / `IndexInfo` / `TableStats` / `ColumnStats` | `contracts/storage.py` |
 | C → 追踪器 | 计划、规则日志、选路结果、执行统计 | 追踪器既有契约 |
 | bench → 仓库 | 对比表与报告 | `docs/v3-dev/benchmark-report.md` |
@@ -221,8 +229,8 @@ Runner.execute(sql, physical="auto")    → 依统计与索引清单自行选择
 | 模块 | 新增内容 | 对外公开接口 | 消费什么 | 明确不做 | 依赖 |
 |---|---|---|---|---|---|
 | A 编译 | F1：索引 DDL 文法与 AST | `parse` / `parse_script` | 无 | 不查表、不查列、不认识索引存储 | 无，契约冻结后即可开工 |
-| B 存储 | F2/F3/F4：索引、索引扫描、统计 | `BaseStorage` 新增 5 方法 | 表名、列名、索引名、`op`、字面量 | 不认识 SQL 与计划、不做选路 | 契约冻结后即可开工 |
-| C 运行 | F5/F6/F7：优化器、选路、下推、执行器 | `Runner.execute(..., physical=...)` | `describe` / `statistics` / `list_indexes` / `index_scan` | 不碰索引文件格式、不直接 import storage 实现 | 需要 A 的 AST 与 B 的接口 |
+| B 存储 | F2/F3/F4：索引、索引查找、统计 | `BaseStorage` 新增 6 方法 | 表名、列名、索引名、键值、键区间 | 不认识 SQL 与比较运算符、不做选路 | 契约冻结后即可开工 |
+| C 运行 | F5/F6/F7：优化器、选路、下推、执行器 | `Runner.execute(..., physical=...)` | `describe` / `statistics` / `list_indexes` / `index_lookup` / `index_range` | 不碰索引文件格式、不直接 import storage 实现 | 需要 A 的 AST 与 B 的接口 |
 | bench | F8：基准与报告 | 三家公开入口 | 全部 | 不绕过公开接口、不直接读写内部结构 | 全部就绪（可先搭空壳） |
 
 三方互不 import 的红线保持不变；装配层为 `main.py` 与 `bench/`。
@@ -244,8 +252,8 @@ Runner.execute(sql, physical="auto")    → 依统计与索引清单自行选择
 ### 7.2 索引与索引扫描
 
 - 契约要求：任何完成的写入之后，索引与表数据保持一致；删表时索引一并清理。
-- 契约要求：`index_scan` 的结果与 `scan` 过滤后一致，且 `Row` 形状相同。
-- 契约要求：`op` 取值集合与 BOOLEAN 限制按 4.2 执行。
+- 契约要求：索引查找的结果与 `scan` 过滤后一致，且 `Row` 形状相同。
+- 契约要求：索引键序与 C 的比较语义一致；C 负责值归纳，B 只按列类型收值。
 
 > 备注（给 B）：索引文件布局、页复用、维护时机（同步 / 延迟）由你定；
 > 契约只承诺"一致"与"形状相同"这两条可测语义。
@@ -269,7 +277,7 @@ Runner.execute(sql, physical="auto")    → 依统计与索引清单自行选择
 ### 7.5 谓词下推
 
 - 契约要求：下推是优化而非语义改变——不下推也必须结果正确。
-- 契约要求：C 只向 B 传 `op ∈ {=, <, <=, >, >=}`。
+- 契约要求：C 负责把比较运算符翻译成键值或键区间后再调用 B；B 的接口不出现操作符。
 
 > 备注（给 C）：哪些谓词"可下推"由你定；请用测试兜住"不下推不漏行"。
 
@@ -279,7 +287,7 @@ Runner.execute(sql, physical="auto")    → 依统计与索引清单自行选择
 |---|---|---|
 | V3-T1 | 索引 DDL | 建/删/列出；重名 `E_INDEX_EXISTS`；不存在 `E_INDEX_NOT_FOUND`；列不存在 `E_COLUMN_NOT_FOUND`；`CREATE UNIQUE INDEX` 报 `E_SYNTAX` |
 | V3-T2 | 索引一致性 | insert/update/delete 之后索引与表数据一致；删表后索引消失 |
-| V3-T3 | 索引扫描语义 | `index_scan` 结果与 `scan` 过滤结果逐行一致；`Row` 形状相同；不支持的操作符报 `E_BAD_ARG` |
+| V3-T3 | 索引查找语义 | `index_lookup` / `index_range` 结果与 `scan` 过滤结果逐行一致；`Row` 形状相同；`None` 端点表示无界；无索引报 `E_INDEX_NOT_FOUND` |
 | V3-T4 | 统计语义 | 有/无表；空表零值；`page_count` 口径；DML 后统计不早于最近一次写入 |
 | V3-T5 | 优化等价 | 同一批查询在优化器开 / 关两种模式下结果逐条一致 |
 | V3-T6 | 选路正确 | 高选择性走索引、低选择性放弃索引；无统计、无索引时安全退化 |

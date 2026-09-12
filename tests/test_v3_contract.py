@@ -132,6 +132,15 @@ _ORIGINAL_STORAGE_METHODS = (
     "delete_row",
 )
 
+_V3_STORAGE_METHODS = (
+    "create_index",
+    "drop_index",
+    "list_indexes",
+    "statistics",
+    "index_lookup",
+    "index_range",
+)
+
 
 def test_base_storage_keeps_v1_v2_methods() -> None:
     """V3 只增不减：原有八个表级方法必须一个不少。"""
@@ -139,14 +148,31 @@ def test_base_storage_keeps_v1_v2_methods() -> None:
         assert callable(getattr(BaseStorage, name, None)), name
 
 
+def test_base_storage_public_method_set_is_locked() -> None:
+    """公开方法集合即契约：增删方法都必须是一次显式决定。"""
+    public_methods = {
+        name for name in BaseStorage.__dict__ if not name.startswith("_")
+    }
+    assert public_methods == set(_ORIGINAL_STORAGE_METHODS) | set(_V3_STORAGE_METHODS)
+
+
 def test_base_storage_declares_v3_methods() -> None:
-    """新增五个方法的参数名、默认值与返回注解即契约。"""
+    """新增方法的参数名、默认值与返回注解即契约。"""
     expected_parameters = {
         "create_index": ["self", "name", "table", "column"],
         "drop_index": ["self", "name"],
         "list_indexes": ["self", "table"],
         "statistics": ["self", "table"],
-        "index_scan": ["self", "table", "column", "op", "value"],
+        "index_lookup": ["self", "table", "column", "key"],
+        "index_range": [
+            "self",
+            "table",
+            "column",
+            "lower",
+            "upper",
+            "lower_inclusive",
+            "upper_inclusive",
+        ],
     }
     for name, parameters in expected_parameters.items():
         method = getattr(BaseStorage, name)
@@ -157,9 +183,29 @@ def test_base_storage_declares_v3_methods() -> None:
     )
     assert inspect.signature(BaseStorage.statistics).return_annotation == "TableStats"
     assert (
-        inspect.signature(BaseStorage.index_scan).return_annotation
+        inspect.signature(BaseStorage.index_lookup).return_annotation
         == "Iterator[Row]"
     )
+    assert (
+        inspect.signature(BaseStorage.index_range).return_annotation
+        == "Iterator[Row]"
+    )
+
+
+def test_index_range_bounds_are_keyword_only_with_inclusive_defaults() -> None:
+    """区间端点默认闭区间，且必须只能按关键字传入，避免位置参数写错。"""
+    parameters = inspect.signature(BaseStorage.index_range).parameters
+    for name in ("lower_inclusive", "upper_inclusive"):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert parameters[name].default is True, name
+
+
+def test_storage_contract_carries_no_comparison_operator() -> None:
+    """比较语义归 C：B 的索引接口不得出现操作符类参数。"""
+    forbidden = {"op", "operator", "cmp", "comparison"}
+    for name in _V3_STORAGE_METHODS:
+        parameters = inspect.signature(getattr(BaseStorage, name)).parameters
+        assert not forbidden & set(parameters), name
 
 
 # ---------- 错误码 ----------

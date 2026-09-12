@@ -8,11 +8,15 @@ B 的表数据与系统目录都必须通过 4KB 页式存储、Buffer Pool 和�
 
 V3 新增索引与统计能力：
 - BaseStorage 增加 create_index / drop_index / list_indexes /
-  statistics / index_scan 五个方法；
+  statistics / index_lookup / index_range 六个方法；
 - 共享形状增加 IndexInfo / ColumnStats / TableStats。
 索引文件布局、索引维护时机与统计采集方式均属 B 的内部实现，不进契约；
-契约只约束可观察语义：索引与数据一致、index_scan 与 scan 的行形状一致、
+契约只约束可观察语义：索引与数据一致、索引查找与 scan 的行形状一致、
 统计不得早于该表最近一次已完成的写操作。
+
+比较语义属 C：C 把 SQL 比较运算符翻译成键值或键区间后再调用 B，B 的索引
+接口不接收操作符，只负责"按列键序"返回命中行。跨类型的值归纳（例如
+INT 列收到 1.0 时由 C 先归一为 1）同样由 C 完成，B 只按列类型收值。
 
 红线：
 - B 不解析 SQL，不知道 SELECT / WHERE 是什么；
@@ -128,12 +132,17 @@ class BaseStorage(Protocol):
 
     def statistics(self, table: str) -> TableStats: ...
 
-    def index_scan(
+    def index_lookup(self, table: str, column: str, key: Value) -> Iterator[Row]: ...
+
+    def index_range(
         self,
         table: str,
         column: str,
-        op: str,
-        value: Value,
+        lower: Value | None,
+        upper: Value | None,
+        *,
+        lower_inclusive: bool = True,
+        upper_inclusive: bool = True,
     ) -> Iterator[Row]: ...
 
 
