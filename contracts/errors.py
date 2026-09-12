@@ -13,7 +13,8 @@
 - SQL 文件无法读取由 C 的脚本执行入口抛 E_INPUT_FILE。
 - 索引不存在（删索引、索引查找找不到对应索引、physical="index" 但无可用
   索引）与建索引重名由 B 抛 E_INDEX_NOT_FOUND / E_INDEX_EXISTS；索引列
-  不存在复用 E_COLUMN_NOT_FOUND。
+  不存在复用 E_COLUMN_NOT_FOUND。索引存在性一律由 B 判定，C 不维护第二份
+  判断；C 只在强制索引模式下无法为该查询构造索引请求时抛 E_BAD_ARG。
 
 REPL 捕获 SqlError 后打印 [错误码] 消息，然后回到提示符。
 """

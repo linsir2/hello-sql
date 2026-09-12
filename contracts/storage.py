@@ -86,6 +86,11 @@ class TableStats:
 
     page_count 只计数据页，不含页 0、空闲页与溢出链页——这是代价估算
     可直接使用的口径，属契约定义而非实现细节。
+
+    columns 必须按建表列顺序**完整**包含该表的全部用户列，不得省略任何
+    列：C 的估算器按列名取统计，缺列会造成静默的退化估算。空表按
+    row_count=0、page_count=0 返回，列统计的 distinct_count 为 0、
+    min_value / max_value 为 None。
     """
 
     table: str

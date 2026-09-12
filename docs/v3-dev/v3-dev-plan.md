@@ -133,6 +133,7 @@ def index_range(
 - **索引键序必须与 C 的比较语义一致**：等值查找能命中的键，必须是 C 认为"相等"的值；区间查找返回的键，必须落在 C 所理解的区间内。
 - `index_lookup` / `index_range` 在（表，列）上没有对应索引时 → `E_INDEX_NOT_FOUND`。
 - `list_indexes()` 不带表名时返回该库全部索引，顺序稳定。
+- `TableStats.columns` 必须按建表列顺序**完整**包含该表的全部用户列；缺列会让 C 静默退化估算，属契约违反。
 
 ### 4.3 `contracts/errors.py`
 
@@ -168,6 +169,31 @@ def execute(
 - C：绑定、逻辑计划、优化规则、选路结果、执行统计。
 
 优化器阶段从当前实现的 `OFF` 变为有内容，是 V3 对追踪器的唯一增量。
+
+### 4.6 新增方法的失败码与责任方
+
+"谁抛"遵循既有约定：**C 能预检的语义错误由 C 抛，B 在自己的方法边界同码防御；
+只有 B 才是权威的事实（如索引是否已存在）由 B 抛。**
+
+| 方法 | 失败码 | 谁抛 | 触发条件 |
+|---|---|---|---|
+| `create_index` | `E_BAD_ARG` | B（边界） | 索引名 / 表名 / 列名非法或以 `__sys_` 开头 |
+| `create_index` | `E_TABLE_NOT_FOUND` | C 预检，B 边界同码 | 目标表不存在 |
+| `create_index` | `E_COLUMN_NOT_FOUND` | C 预检，B 边界同码 | 目标列不存在 |
+| `create_index` | `E_INDEX_EXISTS` | **B** | 索引名已存在；只有 B 能原子判定，C 不预检 |
+| `drop_index` | `E_BAD_ARG` | B（边界） | 索引名非法 |
+| `drop_index` | `E_INDEX_NOT_FOUND` | **B** | 索引不存在 |
+| `list_indexes` | `E_BAD_ARG` | B（边界） | 表名非法或以 `__sys_` 开头 |
+| `list_indexes` | `E_TABLE_NOT_FOUND` | B | 传入了表名但该表不存在 |
+| `statistics` | `E_BAD_ARG` | B（边界） | 表名非法或以 `__sys_` 开头 |
+| `statistics` | `E_TABLE_NOT_FOUND` | B 边界（C 通常已由 `describe` 预检） | 表不存在 |
+| `index_lookup` / `index_range` | `E_INDEX_NOT_FOUND` | **B** | 该（表，列）上没有索引 |
+| `index_lookup` / `index_range` | `E_TYPE_MISMATCH` | B | 键值类型与列类型不符（C 应先完成值归纳） |
+| `index_lookup` / `index_range` | `E_TABLE_NOT_FOUND` | B 边界同码 | 表不存在 |
+| `index_lookup` / `index_range` | `E_BAD_ARG` | B（边界） | 表名或列名非法 |
+
+**索引存在性一律由 B 判定**：C 不维护第二份"有没有索引"的判断。`E_INDEX_EXISTS`
+与 `E_INDEX_NOT_FOUND` 只可能来自 B。
 
 ## 5. 数据流与交接
 
@@ -209,9 +235,17 @@ Runner.execute(sql, physical="index")   → 跳过选路，强制索引访问
 Runner.execute(sql, physical="auto")    → 依统计与索引清单自行选择（默认）
 ```
 
-强制模式只影响选路，不影响结果正确性。`physical="index"` 在没有任何可用索引时
-**必须报错（`E_INDEX_NOT_FOUND`），不得静默退化为顺序扫描**——否则基准会把
-"没走索引"误判成"走了索引"，对比数据失去意义。
+强制模式只影响选路，不影响结果正确性。判定机制如下：
+
+- **C 在强制模式下不判断索引是否存在**：只要能把谓词翻译成（表，列，键值或
+  键区间），就直接调用 B 的索引接口；有索引则执行，没有则由 **B 抛
+  `E_INDEX_NOT_FOUND`**。`list_indexes` 只服务 `auto` 模式的选路，不参与强制
+  模式的判定，因此索引错误的归属在所有路径下完全一致。
+- **唯一由 C 抛的情形**：整条查询没有任何可翻译成索引访问的条件（例如
+  `SELECT * FROM t`，或谓词所在列无法形成键值 / 键区间），C 无法构造索引请求，
+  按调用参数对该查询无效处理，抛 `E_BAD_ARG`。
+- **不得静默退化为顺序扫描**——否则基准会把"没走索引"误判成"走了索引"，
+  对比数据失去意义。
 
 ### 5.4 交接点汇总
 
@@ -288,12 +322,16 @@ Runner.execute(sql, physical="auto")    → 依统计与索引清单自行选择
 | V3-T1 | 索引 DDL | 建/删/列出；重名 `E_INDEX_EXISTS`；不存在 `E_INDEX_NOT_FOUND`；列不存在 `E_COLUMN_NOT_FOUND`；`CREATE UNIQUE INDEX` 报 `E_SYNTAX` |
 | V3-T2 | 索引一致性 | insert/update/delete 之后索引与表数据一致；删表后索引消失 |
 | V3-T3 | 索引查找语义 | `index_lookup` / `index_range` 结果与 `scan` 过滤结果逐行一致；`Row` 形状相同；`None` 端点表示无界；无索引报 `E_INDEX_NOT_FOUND` |
-| V3-T4 | 统计语义 | 有/无表；空表零值；`page_count` 口径；DML 后统计不早于最近一次写入 |
+| V3-T4 | 统计语义 | 有/无表；空表零值；`page_count` 口径；`columns` 完整且按建表列顺序；DML 后统计不早于最近一次写入 |
 | V3-T5 | 优化等价 | 同一批查询在优化器开 / 关两种模式下结果逐条一致 |
 | V3-T6 | 选路正确 | 高选择性走索引、低选择性放弃索引；无统计、无索引时安全退化 |
 | V3-T7 | 强制模式 | `seq` / `index` / `auto` 三种模式结果逐条一致 |
 | V3-T8 | 基准报告 | 三模式对比表产出，含页读取次数与加速比；报告文件进仓库 |
 | V3-T9 | 回归 | V1 37 条 golden 与 V2 全部用例不倒退 |
+
+等价性的责任划分：**模块内的"优化开 / 关结果一致"由 C 主责**（V3-T5、V3-T7）；
+**bench 只做端到端复核**（V3-T8），不承担等价性的一线责任——避免出现"两边都
+以为对方测了"。
 
 ## 9. 里程碑与依赖顺序
 
