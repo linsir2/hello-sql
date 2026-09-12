@@ -1,10 +1,18 @@
-"""契约 V2.0：Storage 共享数据形状与公开接口协议。
+"""契约 V3.0：Storage 共享数据形状与公开接口协议。
 
 BaseDatabaseServer 和 BaseStorage 只约定 B 向 C 暴露的方法；具体实现、
 文件格式与内部状态均由 storage/ 维护。
 
 B 的表数据与系统目录都必须通过 4KB 页式存储、Buffer Pool 和统一记录
 编解码链路持久化。V2 不再允许以独立 JSON 文件作为权威系统目录。
+
+V3 新增索引与统计能力：
+- BaseStorage 增加 create_index / drop_index / list_indexes /
+  statistics / index_scan 五个方法；
+- 共享形状增加 IndexInfo / ColumnStats / TableStats。
+索引文件布局、索引维护时机与统计采集方式均属 B 的内部实现，不进契约；
+契约只约束可观察语义：索引与数据一致、index_scan 与 scan 的行形状一致、
+统计不得早于该表最近一次已完成的写操作。
 
 红线：
 - B 不解析 SQL，不知道 SELECT / WHERE 是什么；
@@ -41,6 +49,47 @@ class TableInfo:
     columns: tuple[ColumnDef, ...]   # 建表顺序，只读
 
 
+@dataclass(frozen=True)
+class IndexInfo:
+    """索引元数据：list_indexes 的返回格式，由 B 构造、C 读取。
+
+    本轮只支持单列、非唯一索引，因此不提供 unique 字段；将来做 UNIQUE
+    或多列索引时需要升契约版本再增加字段。
+    """
+
+    name: str
+    table: str
+    column: str
+
+
+@dataclass(frozen=True)
+class ColumnStats:
+    """列级统计：供 C 估算选择性与代价。
+
+    空表（或该列尚无数据）时 distinct_count 为 0、min_value / max_value
+    为 None；取值是否精确由 B 的采集策略决定，C 不得假设其精确。
+    """
+
+    name: str
+    distinct_count: int
+    min_value: Value | None
+    max_value: Value | None
+
+
+@dataclass(frozen=True)
+class TableStats:
+    """表级统计：statistics 的返回格式，由 B 构造、C 读取。
+
+    page_count 只计数据页，不含页 0、空闲页与溢出链页——这是代价估算
+    可直接使用的口径，属契约定义而非实现细节。
+    """
+
+    table: str
+    row_count: int
+    page_count: int
+    columns: tuple[ColumnStats, ...]
+
+
 class BaseStorage(Protocol):
     """绑定单个数据库的表级存储接口。"""
 
@@ -68,6 +117,24 @@ class BaseStorage(Protocol):
     ) -> None: ...
 
     def delete_row(self, name: str, row_id: RowId) -> None: ...
+
+    # ---- V3：索引与统计 ----
+
+    def create_index(self, name: str, table: str, column: str) -> None: ...
+
+    def drop_index(self, name: str) -> None: ...
+
+    def list_indexes(self, table: str | None = None) -> list[IndexInfo]: ...
+
+    def statistics(self, table: str) -> TableStats: ...
+
+    def index_scan(
+        self,
+        table: str,
+        column: str,
+        op: str,
+        value: Value,
+    ) -> Iterator[Row]: ...
 
 
 class BaseDatabaseServer(Protocol):

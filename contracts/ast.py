@@ -1,4 +1,4 @@
-"""契约 V2.0：SQL 编译模块输出、运行模块输入的共享 AST。
+"""契约 V3.0：SQL 编译模块输出、运行模块输入的共享 AST。
 
 V2 在 V1.1 的基础上增加：
 - BOOLEAN 类型与布尔字面量；
@@ -7,11 +7,15 @@ V2 在 V1.1 的基础上增加：
 - INNER JOIN；
 - 带源码范围的多语句解析结果。
 
+V3 在 V2 的基础上增加：
+- 索引 DDL：CREATE INDEX / DROP INDEX 的语句节点（仅单列、非唯一索引）。
+
 不变式：
 - database / table / column / alias 名均已转为小写且非空；
 - 数字和布尔字面量已经转换为 Python 原生值；
 - 括号不单独保留节点，其作用体现在表达式树结构中；
-- V2 只支持 INNER JOIN，不包含 ORDER BY、LIMIT、NULL、聚合和子查询。
+- V2 只支持 INNER JOIN，不包含 ORDER BY、LIMIT、NULL、聚合和子查询；
+- V3 不含 UNIQUE 与多列组合索引，AST 不为此预留字段。
 """
 
 from __future__ import annotations
@@ -205,12 +209,37 @@ class DeleteStmt:
     where: Expr | None
 
 
+# ---------- 索引语句（V3） ----------
+
+
+@dataclass(frozen=True)
+class CreateIndexStmt:
+    """CREATE INDEX：单列、非唯一索引。
+
+    本轮不支持 UNIQUE 与多列组合索引；索引名在同一数据库内唯一，
+    与表名、列名共用标识符规则并在进入 AST 前统一小写。
+    """
+
+    index_name: str
+    table: str
+    column: str
+
+
+@dataclass(frozen=True)
+class DropIndexStmt:
+    """DROP INDEX：索引名在数据库内唯一，因此不需要表名。"""
+
+    index_name: str
+
+
 Statement: TypeAlias = (
     CreateDatabaseStmt
     | DropDatabaseStmt
     | UseDatabaseStmt
     | CreateTableStmt
     | DropTableStmt
+    | CreateIndexStmt
+    | DropIndexStmt
     | InsertStmt
     | SelectStmt
     | UpdateStmt

@@ -1,4 +1,4 @@
-"""契约 V2.0：错误码与异常（三个模块共用）。
+"""契约 V3.0：错误码与异常（三个模块共用）。
 
 归属规则（谁抛什么，写在谁的错误上）：
 - E_SYNTAX：A 抛（ParseError）；
@@ -11,6 +11,9 @@
   正常 SQL 路径由 A 的标识符规则保证不会触发。
 - 限定列、别名和布尔表达式错误由 C 在名称绑定或类型绑定阶段抛；
 - SQL 文件无法读取由 C 的脚本执行入口抛 E_INPUT_FILE。
+- 索引不存在（删索引、index_scan 找不到对应索引、physical="index" 但无
+  可用索引）与建索引重名由 B 抛 E_INDEX_NOT_FOUND / E_INDEX_EXISTS；
+  索引列不存在复用 E_COLUMN_NOT_FOUND。
 
 REPL 捕获 SqlError 后打印 [错误码] 消息，然后回到提示符。
 """
@@ -43,6 +46,10 @@ E_BAD_ARG = "E_BAD_ARG"
 
 # 多语句与 SQL 文件执行
 E_INPUT_FILE = "E_INPUT_FILE"
+
+# 索引（V3）
+E_INDEX_EXISTS = "E_INDEX_EXISTS"
+E_INDEX_NOT_FOUND = "E_INDEX_NOT_FOUND"
 
 
 class SqlError(Exception):
